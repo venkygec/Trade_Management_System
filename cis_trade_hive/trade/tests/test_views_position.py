@@ -32,6 +32,7 @@ class PositionListViewTestCase(TestCase):
             'position_type': 'INT',
             'quantity': 100,
             'average_cost_fc': 10.12345678,
+            'average_cost_lc': 10.12345678,
             'cost_fc': 1000,
             'cost_lc': 1000,
             'market_value_fc': 1200,
