@@ -66,7 +66,8 @@ class PositionListViewTestCase(TestCase):
 
         self.assertEqual(response.status_code, 200)
         content = response.content.decode()
-        table_headers = re.findall(r'<th[^>]*>\s*([^<].*?)\s*<span class="sort-icon">', content)
+        table_headers = re.findall(r'onclick="sortBy\([^)]+\)">\s*([^<]+?)\s*<span class="sort-icon"></span>', content)
+        self.assertGreaterEqual(len(table_headers), 8)
         self.assertEqual(
             table_headers[:8],
             [
