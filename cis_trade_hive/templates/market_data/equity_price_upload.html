@@ -56,19 +56,12 @@
         <div class="card-body">
             <!-- Expected format info -->
             <div class="alert alert-info mb-3">
-                <strong>Format A – direct price:</strong>
+                <strong>Expected columns:</strong>
                 <code>security_label</code>,
                 <code>currency_code</code>,
                 <code>price_date</code> (YYYY-MM-DD),
                 <code>main_closing_price</code> (positive number),
-                <code>isin</code> (optional)<br>
-                <strong>Format B – position upload:</strong>
-                <code>security_label</code>,
-                <code>currency_code</code>,
-                <code>price_date</code>,
-                <code>market_value</code>,
-                <code>quantity</code>,
-                <code>isin</code> (optional) — price is calculated as <em>market_value / quantity</em>
+                <code>isin</code> (optional)
             </div>
 
             <div id="drop-zone" onclick="document.getElementById('csv-file-input').click()">

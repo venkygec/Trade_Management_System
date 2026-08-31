@@ -49,8 +49,12 @@
         <div class="card-body">
             <div class="alert alert-info mb-3">
                 Candidates are pulled from <code>cis_position</code> for <strong>today</strong> with
-                <code>is_latest = true</code>. Price is implied as
-                <code>market_value_fc / quantity</code>.
+                <code>is_latest = true</code>. The implied price (<code>market_value_fc / quantity</code>)
+                is pre-calculated. The downloaded CSV uses the standard equity price upload format
+                (<code>security_label, currency_code, price_date, main_closing_price, isin</code>)
+                and can be reviewed offline, then uploaded here or via the
+                <a href="{% url 'market_data:equity_price_upload' %}">equity price upload page</a>.
+                When uploaded from this page the source is recorded as <strong>POSITION_UPLOAD</strong>.
             </div>
             <button class="btn btn-primary" id="btn-generate">
                 <i class="bi bi-play-circle"></i> Generate Extraction
@@ -73,11 +77,12 @@
             </h5>
             <div class="d-flex gap-2">
                 <a id="btn-download" href="{% url 'market_data:position_price_extraction_download' %}"
-                   class="btn btn-outline-secondary btn-sm">
+                   class="btn btn-outline-secondary btn-sm" title="Download as CSV (standard equity price upload format with pre-computed prices)">
                     <i class="bi bi-download"></i> Download CSV
                 </a>
-                <button class="btn btn-success btn-sm" id="btn-upload" disabled>
-                    <i class="bi bi-cloud-upload"></i> Upload to Equity Prices
+                <button class="btn btn-success btn-sm" id="btn-upload" disabled
+                        title="Upload directly with source = POSITION_UPLOAD">
+                    <i class="bi bi-cloud-upload"></i> Upload (source: POSITION_UPLOAD)
                 </button>
             </div>
         </div>
