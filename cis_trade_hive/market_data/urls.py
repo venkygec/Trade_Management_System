@@ -23,6 +23,12 @@ urlpatterns = [
     path('equity-prices/upload/validate/', views.equity_price_validate_file, name='equity_price_validate_file'),
     path('equity-prices/upload/submit/', views.equity_price_upload_chunk, name='equity_price_upload_chunk'),
 
+    # Position Price Extraction (Subsi / Associate investments)
+    path('equity-prices/position-extraction/', views.position_price_extraction, name='position_price_extraction'),
+    path('equity-prices/position-extraction/data/', views.position_price_extraction_data, name='position_price_extraction_data'),
+    path('equity-prices/position-extraction/download/', views.position_price_extraction_download, name='position_price_extraction_download'),
+    path('equity-prices/position-extraction/upload/', views.position_price_extraction_upload, name='position_price_extraction_upload'),
+
     path('equity-prices/<str:currency_code>/<str:price_date>/detail/', views.equity_price_detail, name='equity_price_detail'),
     path('equity-prices/<str:currency_code>/<str:price_date>/edit/', views.equity_price_edit, name='equity_price_edit'),
 ]

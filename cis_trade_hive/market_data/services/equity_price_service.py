@@ -575,19 +575,50 @@ class EquityPriceService:
             raise ValidationError(f"Invalid date: {date_str}")
 
     # Required CSV columns (case-insensitive header match)
+    # Format A: direct price  →  main_closing_price required
+    # Format B: position upload → market_value + quantity required (price = market_value / quantity)
     UPLOAD_REQUIRED_COLUMNS = {'security_label', 'currency_code', 'price_date', 'main_closing_price'}
+    UPLOAD_POSITION_REQUIRED_COLUMNS = {'security_label', 'currency_code', 'price_date', 'market_value', 'quantity'}
     UPLOAD_OPTIONAL_COLUMNS = {'isin'}
 
     @staticmethod
-    def build_upload_preview(file_obj) -> Dict[str, Any]:
+    def _detect_upload_format(headers: list) -> str:
+        """
+        Detect which upload format is being used.
+
+        Returns 'price' (direct main_closing_price) or 'position' (market_value+quantity).
+        Raises ValueError if neither set of required columns is present.
+        """
+        header_set = set(headers)
+        has_price_format = EquityPriceService.UPLOAD_REQUIRED_COLUMNS.issubset(header_set)
+        has_position_format = EquityPriceService.UPLOAD_POSITION_REQUIRED_COLUMNS.issubset(header_set)
+        if has_position_format:
+            return 'position'
+        if has_price_format:
+            return 'price'
+        # Neither format satisfied — report the closer match
+        missing_price = EquityPriceService.UPLOAD_REQUIRED_COLUMNS - header_set
+        missing_position = EquityPriceService.UPLOAD_POSITION_REQUIRED_COLUMNS - header_set
+        if len(missing_position) <= len(missing_price):
+            raise ValueError(f"Missing required columns for position format: {', '.join(sorted(missing_position))}")
+        raise ValueError(f"Missing required columns: {', '.join(sorted(missing_price))}")
+
+    @staticmethod
+    def build_upload_preview(file_obj, src_system: str = 'CIS') -> Dict[str, Any]:
         """
         Parse and validate a CSV file for equity price upload.
+
+        Supports two formats:
+          Format A (direct price):   security_label, currency_code, price_date, main_closing_price [, isin]
+          Format B (position upload): security_label, currency_code, price_date, market_value, quantity [, isin]
+                                      price is calculated as market_value / quantity.
 
         Returns a dict with:
           - valid_rows    : list of clean dicts ready for upsert
           - invalid_rows  : list of {'row': n, 'data': {}, 'errors': [...]}
           - total         : total rows parsed
           - columns_found : list of header columns detected
+          - upload_format : 'price' or 'position'
           - error         : top-level parse error string (or None)
         """
         result = {
@@ -595,6 +626,7 @@ class EquityPriceService:
             'invalid_rows': [],
             'total': 0,
             'columns_found': [],
+            'upload_format': None,
             'error': None,
         }
 
@@ -609,10 +641,13 @@ class EquityPriceService:
             headers = [h.strip().lower() for h in (reader.fieldnames or [])]
             result['columns_found'] = headers
 
-            missing = EquityPriceService.UPLOAD_REQUIRED_COLUMNS - set(headers)
-            if missing:
-                result['error'] = f"Missing required columns: {', '.join(sorted(missing))}"
+            try:
+                upload_format = EquityPriceService._detect_upload_format(headers)
+            except ValueError as e:
+                result['error'] = str(e)
                 return result
+
+            result['upload_format'] = upload_format
 
             for row_num, raw_row in enumerate(reader, start=2):
                 row = {k.strip().lower(): (v or '').strip() for k, v in raw_row.items()}
@@ -621,7 +656,6 @@ class EquityPriceService:
                 security_label = row.get('security_label', '')
                 currency_code  = row.get('currency_code', '')
                 price_date     = row.get('price_date', '')
-                price_str      = row.get('main_closing_price', '')
                 isin           = row.get('isin', '') or None
 
                 if not security_label:
@@ -636,16 +670,41 @@ class EquityPriceService:
                     except ValidationError as e:
                         errors.append(str(e.message))
 
-                if not price_str:
-                    errors.append('main_closing_price is required')
+                price_val = None
+
+                if upload_format == 'position':
+                    # Format B: derive price from market_value / quantity
+                    mv_str  = row.get('market_value', '')
+                    qty_str = row.get('quantity', '')
+                    if not mv_str:
+                        errors.append('market_value is required')
+                    if not qty_str:
+                        errors.append('quantity is required')
+                    if mv_str and qty_str:
+                        try:
+                            mv_val  = Decimal(mv_str)
+                            qty_val = Decimal(qty_str)
+                            if qty_val == 0:
+                                errors.append('quantity must not be zero')
+                            else:
+                                price_val = (mv_val / qty_val).quantize(Decimal('0.000001'))
+                                if price_val < 0:
+                                    errors.append('calculated price (market_value / quantity) must not be negative')
+                        except InvalidOperation:
+                            errors.append('market_value and quantity must be valid numbers')
                 else:
-                    try:
-                        price_val = Decimal(price_str)
-                        if price_val < 0:
-                            errors.append('main_closing_price must not be negative')
-                    except InvalidOperation:
-                        errors.append(f'main_closing_price "{price_str}" is not a valid number')
-                        price_val = None
+                    # Format A: price provided directly
+                    price_str = row.get('main_closing_price', '')
+                    if not price_str:
+                        errors.append('main_closing_price is required')
+                    else:
+                        try:
+                            price_val = Decimal(price_str)
+                            if price_val < 0:
+                                errors.append('main_closing_price must not be negative')
+                        except InvalidOperation:
+                            errors.append(f'main_closing_price "{price_str}" is not a valid number')
+                            price_val = None
 
                 result['total'] += 1
 
@@ -657,17 +716,17 @@ class EquityPriceService:
                     })
                 else:
                     result['valid_rows'].append({
-                        'security_label':    security_label,
-                        'currency_code':     currency_code,
-                        'price_date':        price_date,
+                        'security_label':     security_label,
+                        'currency_code':      currency_code,
+                        'price_date':         price_date,
                         'main_closing_price': str(price_val),
-                        'isin':              isin,
-                        'src_system':        'CIS',
+                        'isin':               isin,
+                        'src_system':         src_system,
                     })
 
         except Exception as e:
             logger.error(f"Error parsing equity price CSV: {e}")
-            result['error'] = str(e)
+            result['error'] = 'Unexpected error while parsing the CSV file.'
 
         return result
 

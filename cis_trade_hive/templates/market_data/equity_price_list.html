@@ -35,6 +35,9 @@
         <a href="{% url 'market_data:equity_price_upload' %}" class="btn btn-info text-white">
             <i class="bi bi-cloud-upload"></i> Upload CSV
         </a>
+        <a href="{% url 'market_data:position_price_extraction' %}" class="btn btn-warning text-white">
+            <i class="bi bi-database-down"></i> Position Extraction
+        </a>
         <a href="?export=csv{% if currency_code %}&currency_code={{ currency_code }}{% endif %}{% if security_label %}&security_label={{ security_label }}{% endif %}{% if isin %}&isin={{ isin }}{% endif %}{% if src_system %}&src_system={{ src_system }}{% endif %}{% if date_from %}&date_from={{ date_from }}{% endif %}{% if date_to %}&date_to={{ date_to }}{% endif %}" class="btn btn-success">
             <i class="bi bi-download"></i> Export to CSV
         </a>
