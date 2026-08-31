@@ -420,10 +420,22 @@
                 <thead class="table-light" style="position: sticky; top: 0; z-index: 10;">
                     <tr>
                         {% with sb=sort_by sd=sort_dir %}
+                        <th class="sort-th {% if sb == 'account_group' %}sorted-{{ sd|lower }}{% endif %}"
+                            style="min-width:120px; position:sticky; left:0; background:#f8f9fa; z-index:12;" onclick="sortBy('account_group')">
+                            Account Group <span class="sort-icon"></span>
+                        </th>
                         <th class="sort-th {% if sb == 'portfolio' %}sorted-{{ sd|lower }}{% endif %}"
-                            style="min-width:120px; position:sticky; left:0; background:#f8f9fa; z-index:11;"
+                            style="min-width:120px; position:sticky; left:120px; background:#f8f9fa; z-index:11;"
                             onclick="sortBy('portfolio')">
                             Portfolio <span class="sort-icon"></span>
+                        </th>
+                        <th class="sort-th {% if sb == 'portfolio_currency' %}sorted-{{ sd|lower }}{% endif %}"
+                            style="min-width:80px;" onclick="sortBy('portfolio_currency')">
+                            Portfolio Currency <span class="sort-icon"></span>
+                        </th>
+                        <th class="sort-th {% if sb == 'portfolio_investment_type' %}sorted-{{ sd|lower }}{% endif %}"
+                            style="min-width:140px;" onclick="sortBy('portfolio_investment_type')">
+                            Portfolio Investment Type <span class="sort-icon"></span>
                         </th>
                         <th class="sort-th {% if sb == 'revaluation_status' %}sorted-{{ sd|lower }}{% endif %}"
                             style="min-width:70px;" onclick="sortBy('revaluation_status')">
@@ -432,6 +444,10 @@
                         <th class="sort-th {% if sb == 'security_label' %}sorted-{{ sd|lower }}{% endif %}"
                             style="min-width:180px;" onclick="sortBy('security_label')">
                             Security <span class="sort-icon"></span>
+                        </th>
+                        <th class="sort-th {% if sb == 'security_currency' %}sorted-{{ sd|lower }}{% endif %}"
+                            style="min-width:80px;" onclick="sortBy('security_currency')">
+                            Security Currency <span class="sort-icon"></span>
                         </th>
                         <th class="sort-th {% if sb == 'isin' %}sorted-{{ sd|lower }}{% endif %}"
                             style="min-width:100px;" onclick="sortBy('isin')">
@@ -531,7 +547,8 @@
                 <tbody>
                     {% for p in positions %}
                     <tr>
-                        <td style="position:sticky; left:0; background:#fff; z-index:1;">
+                        <td style="position:sticky; left:0; background:#fff; z-index:2;">{{ p.account_group|default:"-" }}</td>
+                        <td style="position:sticky; left:120px; background:#fff; z-index:1;">
                             {% if p.portfolio %}
                                 <a href="{% url 'portfolio:detail' p.portfolio %}" class="text-primary fw-semibold">
                                     {{ p.portfolio }}
@@ -540,6 +557,8 @@
                                 <strong class="text-muted">-</strong>
                             {% endif %}
                         </td>
+                        <td><code class="small">{{ p.portfolio_currency|default:"-" }}</code></td>
+                        <td>{{ p.portfolio_investment_type|default:"-" }}</td>
                         <td>
                             {% if p.revaluation_status %}
                                 {% with rs=p.revaluation_status|upper %}
@@ -568,6 +587,7 @@
                                 <span class="text-muted">-</span>
                             {% endif %}
                         </td>
+                        <td><code class="small">{{ p.security_currency|default:"-" }}</code></td>
                         <td><code class="small">{{ p.isin|default:"-" }}</code></td>
                         <td>
                             {% if p.position_basis == 'TRADED' %}
