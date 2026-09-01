@@ -159,8 +159,9 @@ def _export_csv(positions):
 
     writer = csv.writer(response)
     writer.writerow([
-        'Account Group', 'Portfolio', 'Portfolio Currency',
-        'Portfolio Investment Type', 'Security', 'Security Currency', 'ISIN', 'Position Basis', 'Position Date',
+        'Account Group', 'Portfolio Entity Group', 'Portfolio', 'Portfolio Currency',
+        'Portfolio Investment Type', 'Security', 'Security Currency', 'Security Quoted/Unquoted',
+        'ISIN', 'Position Basis', 'Position Date',
         'Src System', 'Position Type', 'Quantity',
         'Avg Cost FC', 'Avg Cost LC', 'Cost FC', 'Cost LC',
         'Market Value FC', 'Market Value LC',
@@ -179,11 +180,13 @@ def _export_csv(positions):
     for p in positions:
         writer.writerow([
             p.get('account_group'),
+            p.get('portfolio_entity_group'),
             p.get('portfolio'),
             p.get('portfolio_currency'),
             p.get('portfolio_investment_type'),
             p.get('security_label'),
             p.get('security_currency'),
+            p.get('security_quoted_unquoted'),
             p.get('isin'),
             p.get('position_basis'),
             p.get('position_date'),

@@ -18,12 +18,14 @@ class PositionListViewTestCase(TestCase):
 
         self.position = {
             'account_group': 'AG-1',
+            'portfolio_entity_group': 'UOBS',
             'portfolio': 'PORT-1',
             'portfolio_currency': 'USD',
             'portfolio_investment_type': 'Equity',
             'revaluation_status': 'REVAL',
             'security_label': 'AAPL UQ',
             'security_currency': 'USD',
+            'security_quoted_unquoted': 'QUOTED',
             'security_id': 101,
             'isin': 'US0378331005',
             'position_basis': 'TRADED',
@@ -67,25 +69,29 @@ class PositionListViewTestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         content = response.content.decode()
         table_headers = re.findall(r'onclick="sortBy\([^)]+\)">\s*([^<]+?)\s*<span class="sort-icon"></span>', content)
-        self.assertGreaterEqual(len(table_headers), 8)
+        self.assertGreaterEqual(len(table_headers), 10)
         self.assertEqual(
-            table_headers[:8],
+            table_headers[:10],
             [
                 'Account Group',
+                'Portfolio Entity Group',
                 'Portfolio',
                 'Portfolio Currency',
                 'Portfolio Investment Type',
                 'Reval',
                 'Security',
                 'Security Currency',
+                'Security Quoted/Unquoted',
                 'ISIN',
             ],
         )
 
         self.assertContains(response, 'AG-1')
+        self.assertContains(response, 'UOBS')
         self.assertContains(response, 'PORT-1')
         self.assertContains(response, 'Equity')
         self.assertContains(response, 'AAPL UQ')
+        self.assertContains(response, 'QUOTED')
 
     @patch('trade.views_position.position_repository')
     def test_position_list_csv_export_includes_new_columns(self, mock_repo):
@@ -100,15 +106,20 @@ class PositionListViewTestCase(TestCase):
 
         rows = list(csv.reader(StringIO(response.content.decode())))
         self.assertEqual(
-            rows[0][:7],
+            rows[0][:9],
             [
                 'Account Group',
+                'Portfolio Entity Group',
                 'Portfolio',
                 'Portfolio Currency',
                 'Portfolio Investment Type',
                 'Security',
                 'Security Currency',
+                'Security Quoted/Unquoted',
                 'ISIN',
             ],
         )
-        self.assertEqual(rows[1][:7], ['AG-1', 'PORT-1', 'USD', 'Equity', 'AAPL UQ', 'USD', 'US0378331005'])
+        self.assertEqual(
+            rows[1][:9],
+            ['AG-1', 'UOBS', 'PORT-1', 'USD', 'Equity', 'AAPL UQ', 'USD', 'QUOTED', 'US0378331005'],
+        )

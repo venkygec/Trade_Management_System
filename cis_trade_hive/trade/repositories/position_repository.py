@@ -29,11 +29,13 @@ class PositionRepository:
     # Columns allowed for ORDER BY (whitelist to prevent injection)
     SORTABLE_COLUMNS = {
         'account_group':     'p.account_group',
+        'portfolio_entity_group': 'p.entity_group',
         'portfolio':         'pos.portfolio',
         'portfolio_currency': 'p.currency',
         'portfolio_investment_type': 'p.investment_type',
         'security_label':    'pos.security_label',
         'security_currency': 's.currency_code',
+        'security_quoted_unquoted': 's.quoted_unquoted',
         'isin':              'pos.isin',
         'position_basis':    'pos.position_basis',
         'position_date':     'pos.position_date',
@@ -141,10 +143,12 @@ class PositionRepository:
                 SELECT
                     pos.position_id, pos.version_id,
                     p.account_group AS account_group,
+                    p.entity_group AS portfolio_entity_group,
                     pos.portfolio, pos.security_label,
                     p.currency AS portfolio_currency,
                     p.investment_type AS portfolio_investment_type,
                     s.currency_code AS security_currency,
+                    s.quoted_unquoted AS security_quoted_unquoted,
                     pos.position_basis, pos.position_date,
                     pos.src_system, pos.processing_date,
                     pos.quantity,
