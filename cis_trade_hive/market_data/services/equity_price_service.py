@@ -667,7 +667,7 @@ class EquityPriceService:
 
         except Exception as e:
             logger.error(f"Error parsing equity price CSV: {e}")
-            result['error'] = str(e)
+            result['error'] = 'Unexpected error while parsing the CSV file.'
 
         return result
 

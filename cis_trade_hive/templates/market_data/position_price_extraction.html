@@ -1,0 +1,280 @@
+{% extends 'base.html' %}
+{% load static %}
+
+{% block title %}Position Price Extraction - CisTrade{% endblock %}
+
+{% block breadcrumb %}
+    <li class="breadcrumb-item"><a href="{% url 'dashboard' %}">Dashboard</a></li>
+    <li class="breadcrumb-item"><a href="{% url 'market_data:market_data_dashboard' %}">Market Data</a></li>
+    <li class="breadcrumb-item"><a href="{% url 'market_data:equity_price_list' %}">Equity Prices</a></li>
+    <li class="breadcrumb-item active">Position Price Extraction</li>
+{% endblock %}
+
+{% block extra_css %}
+<style>
+#tbl-candidates th { position: sticky; top: 0; background: #f8f9fa; z-index: 1; }
+.text-mono { font-family: monospace; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div style="max-width: 1200px; margin: 0 auto;">
+
+    <!-- Header -->
+    <div class="content-header d-flex justify-content-between align-items-start mb-4">
+        <div>
+            <h1 class="content-title">
+                <i class="bi bi-database-down text-primary"></i> Position Price Extraction
+            </h1>
+            <p class="content-subtitle">
+                Extract implied equity prices from today's positions for Subsi &amp; Associate holdings.<br>
+                Excludes: portfolio group <strong>UOI</strong>, investment type <em>Subsidiary Co / Associated Co</em>,
+                entity group <strong>UOBS</strong>, QUOTED securities, and securities already priced by CIS.
+            </p>
+        </div>
+        <div class="d-flex gap-2">
+            <a href="{% url 'market_data:equity_price_list' %}" class="btn btn-outline-secondary">
+                <i class="bi bi-arrow-left"></i> Back to List
+            </a>
+        </div>
+    </div>
+
+    <!-- Step 1: Generate -->
+    <div class="card mb-4" id="step-generate">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="card-title mb-0">
+                <i class="bi bi-1-circle text-primary"></i> Extract Candidates
+            </h5>
+        </div>
+        <div class="card-body">
+            <div class="alert alert-info mb-3">
+                Candidates are pulled from <code>cis_position</code> for <strong>today</strong> with
+                <code>is_latest = true</code>. The implied price (<code>market_value_fc / quantity</code>)
+                is pre-calculated. The downloaded CSV uses the standard equity price upload format
+                (<code>security_label, currency_code, price_date, main_closing_price, isin</code>)
+                and can be reviewed offline, then uploaded here or via the
+                <a href="{% url 'market_data:equity_price_upload' %}">equity price upload page</a>.
+                When uploaded from this page the source is recorded as <strong>POSITION_UPLOAD</strong>.
+            </div>
+            <button class="btn btn-primary" id="btn-generate">
+                <i class="bi bi-play-circle"></i> Generate Extraction
+            </button>
+            <div id="spinner-generate" class="d-none mt-3 text-center">
+                <div class="spinner-border text-primary" role="status"></div>
+                <p class="mt-2 text-muted">Querying positions…</p>
+            </div>
+            <div id="alert-generate" class="mt-3"></div>
+        </div>
+    </div>
+
+    <!-- Step 2: Review -->
+    <div class="card mb-4 d-none" id="step-review">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="card-title mb-0">
+                <i class="bi bi-2-circle text-primary"></i>
+                Review &amp; Download
+                <span class="badge bg-secondary ms-2" id="badge-count">0</span>
+            </h5>
+            <div class="d-flex gap-2">
+                <a id="btn-download" href="{% url 'market_data:position_price_extraction_download' %}"
+                   class="btn btn-outline-secondary btn-sm" title="Download as CSV (standard equity price upload format with pre-computed prices)">
+                    <i class="bi bi-download"></i> Download CSV
+                </a>
+                <button class="btn btn-success btn-sm" id="btn-upload" disabled
+                        title="Upload directly with source = POSITION_UPLOAD">
+                    <i class="bi bi-cloud-upload"></i> Upload (source: POSITION_UPLOAD)
+                </button>
+            </div>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive" style="max-height: 500px; overflow-y: auto;">
+                <table class="table table-sm table-hover table-bordered mb-0" id="tbl-candidates">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Security Label</th>
+                            <th>Currency</th>
+                            <th>Price Date</th>
+                            <th class="text-end">Market Value (FC)</th>
+                            <th class="text-end">Quantity</th>
+                            <th class="text-end">Implied Price</th>
+                            <th>ISIN</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tbl-body">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Step 3: Upload Result -->
+    <div class="card d-none" id="step-result">
+        <div class="card-header">
+            <h5 class="card-title mb-0">
+                <i class="bi bi-3-circle text-primary"></i> Upload Result
+            </h5>
+        </div>
+        <div class="card-body" id="result-body"></div>
+    </div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const DATA_URL    = "{% url 'market_data:position_price_extraction_data' %}";
+const UPLOAD_URL  = "{% url 'market_data:position_price_extraction_upload' %}";
+const CSRF_TOKEN  = "{{ csrf_token }}";
+
+let extractedRows = [];
+
+/* ── Generate ──────────────────────────────────────────── */
+document.getElementById('btn-generate').addEventListener('click', async () => {
+    const btn     = document.getElementById('btn-generate');
+    const spinner = document.getElementById('spinner-generate');
+    const alertEl = document.getElementById('alert-generate');
+    alertEl.innerHTML = '';
+    btn.disabled = true;
+    spinner.classList.remove('d-none');
+
+    try {
+        const resp = await fetch(DATA_URL);
+        const data = await resp.json();
+
+        if (data.error) {
+            alertEl.innerHTML = `<div class="alert alert-danger"><i class="bi bi-exclamation-triangle-fill"></i> ${esc(data.error)}</div>`;
+            return;
+        }
+
+        extractedRows = data.rows || [];
+        renderTable(extractedRows);
+
+        document.getElementById('badge-count').textContent = extractedRows.length;
+        document.getElementById('step-review').classList.remove('d-none');
+        document.getElementById('btn-upload').disabled = extractedRows.length === 0;
+        document.getElementById('step-review').scrollIntoView({ behavior: 'smooth' });
+
+        if (extractedRows.length === 0) {
+            alertEl.innerHTML = `<div class="alert alert-warning"><i class="bi bi-info-circle"></i> No candidates found for today. All eligible securities may already be priced.</div>`;
+        }
+    } catch (err) {
+        alertEl.innerHTML = `<div class="alert alert-danger">Network error: ${esc(err.message)}</div>`;
+    } finally {
+        btn.disabled = false;
+        spinner.classList.add('d-none');
+    }
+});
+
+/* ── Render table ──────────────────────────────────────── */
+function renderTable(rows) {
+    const tbody = document.getElementById('tbl-body');
+    if (rows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No candidates found.</td></tr>';
+        return;
+    }
+    tbody.innerHTML = rows.map(r => `
+        <tr>
+            <td class="text-mono">${esc(r.security_label)}</td>
+            <td>${esc(r.currency_code)}</td>
+            <td>${esc(r.price_date)}</td>
+            <td class="text-end text-mono">${fmtNum(r.market_value)}</td>
+            <td class="text-end text-mono">${fmtNum(r.quantity)}</td>
+            <td class="text-end text-mono fw-bold">${r.calculated_price != null ? fmtNum(r.calculated_price, 6) : '<span class="text-danger">N/A</span>'}</td>
+            <td class="text-mono small">${esc(r.isin || '')}</td>
+        </tr>`).join('');
+}
+
+/* ── Upload ────────────────────────────────────────────── */
+document.getElementById('btn-upload').addEventListener('click', async () => {
+    if (!extractedRows.length) return;
+    if (!confirm(`Upload ${extractedRows.length} row(s) to equity prices with source POSITION_UPLOAD?`)) return;
+
+    const btn = document.getElementById('btn-upload');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Uploading…';
+
+    try {
+        const resp = await fetch(UPLOAD_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': CSRF_TOKEN,
+            },
+            body: JSON.stringify({ rows: extractedRows }),
+        });
+        const result = await resp.json();
+        showResult(result);
+    } catch (err) {
+        showResult({ success_count: 0, failure_count: 0, failures: [], error: err.message });
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-cloud-upload"></i> Upload to Equity Prices';
+    }
+});
+
+/* ── Show result ───────────────────────────────────────── */
+function showResult(result) {
+    const stepResult = document.getElementById('step-result');
+    const resultBody = document.getElementById('result-body');
+    stepResult.classList.remove('d-none');
+
+    const success  = result.success_count || 0;
+    const failures = result.failures || [];
+    const realErrs = failures.filter(f => f.error && !f.error.includes('Upsert returned False'));
+
+    let html = '';
+    if (result.error) {
+        html = `<div class="alert alert-danger"><i class="bi bi-exclamation-triangle-fill"></i> ${esc(result.error)}</div>`;
+    } else {
+        if (success > 0) {
+            html += `<div class="alert alert-success"><i class="bi bi-check-circle-fill"></i> <strong>${success}</strong> price(s) uploaded with source <code>POSITION_UPLOAD</code>.</div>`;
+        }
+        if (realErrs.length > 0) {
+            html += `<div class="alert alert-danger"><i class="bi bi-exclamation-triangle-fill"></i> <strong>${realErrs.length}</strong> row(s) failed.</div>`;
+            html += `<div class="table-responsive mb-3" style="max-height:200px;overflow-y:auto;">
+                <table class="table table-sm table-bordered">
+                    <thead class="table-light">
+                        <tr><th>Security</th><th>Currency</th><th>Price Date</th><th>Error</th></tr>
+                    </thead>
+                    <tbody>` +
+                realErrs.map(f => `<tr>
+                    <td>${esc(f.row.security_label || '-')}</td>
+                    <td>${esc(f.row.currency_code || '-')}</td>
+                    <td>${esc(f.row.price_date || '-')}</td>
+                    <td class="text-danger small">${esc(f.error)}</td>
+                </tr>`).join('') +
+                `</tbody></table></div>`;
+        }
+        if (success === 0 && realErrs.length === 0) {
+            html += '<p class="text-muted">Nothing was uploaded.</p>';
+        }
+    }
+    html += `<div class="mt-3">
+        <a href="{% url 'market_data:equity_price_list' %}" class="btn btn-primary">
+            <i class="bi bi-list"></i> View Equity Prices
+        </a>
+        <button class="btn btn-outline-secondary ms-2" onclick="location.reload()">
+            <i class="bi bi-arrow-repeat"></i> Run Again
+        </button>
+    </div>`;
+
+    resultBody.innerHTML = html;
+    stepResult.scrollIntoView({ behavior: 'smooth' });
+}
+
+/* ── Helpers ───────────────────────────────────────────── */
+function esc(str) {
+    return String(str ?? '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function fmtNum(val, decimals = 2) {
+    if (val == null || val === '') return '-';
+    return Number(val).toLocaleString(undefined, {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals,
+    });
+}
+</script>
+{% endblock %}

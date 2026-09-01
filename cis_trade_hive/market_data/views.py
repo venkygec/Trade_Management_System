@@ -12,8 +12,10 @@ from django.core.exceptions import ValidationError
 from datetime import datetime, timedelta
 import csv
 import json
+import logging
 
 from market_data.services import fx_rate_service
+from market_data.services.position_price_extraction_service import position_price_extraction_service
 from core.audit.audit_kudu_repository import audit_log_kudu_repository
 from trade.repositories.trade_kudu_repository import trade_kudu_repository
 
@@ -958,3 +960,77 @@ def equity_price_upload_chunk(request):
         return JsonResponse({'error': 'Invalid JSON body'}, status=400)
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
+
+
+# ---------------------------------------------------------------------------
+# Position Price Extraction views
+# ---------------------------------------------------------------------------
+
+_logger = logging.getLogger(__name__)
+
+def position_price_extraction(request):
+    """Render the Subsi/Associate position price extraction page."""
+    return render(request, 'market_data/position_price_extraction.html')
+
+
+def position_price_extraction_data(request):
+    """
+    API: Return extraction candidates as JSON.
+    GET ?position_date=YYYY-MM-DD  (optional; defaults to today)
+    """
+    from django.http import JsonResponse
+    position_date = request.GET.get('position_date', '').strip() or None
+    try:
+        rows = position_price_extraction_service.get_candidates(position_date=position_date)
+        return JsonResponse({'rows': rows, 'count': len(rows)})
+    except Exception as e:
+        _logger.error("position_price_extraction_data error: %s", e)
+        return JsonResponse({'error': 'Failed to fetch extraction data.'}, status=500)
+
+
+def position_price_extraction_download(request):
+    """
+    API: Stream extraction candidates as a CSV file download.
+    GET ?position_date=YYYY-MM-DD  (optional; defaults to today)
+    """
+    from datetime import date as _date
+    position_date = request.GET.get('position_date', '').strip() or None
+    try:
+        rows = position_price_extraction_service.get_candidates(position_date=position_date)
+        csv_content = position_price_extraction_service.build_csv(rows)
+        filename_date = position_date or _date.today().strftime('%Y-%m-%d')
+        response = HttpResponse(csv_content, content_type='text/csv')
+        response['Content-Disposition'] = (
+            f'attachment; filename="equity_price_extraction_{filename_date}.csv"'
+        )
+        return response
+    except Exception as e:
+        _logger.error("position_price_extraction_download error: %s", e)
+        return HttpResponse('Error generating CSV. Please try again.', status=500)
+
+
+from django.views.decorators.http import require_POST as _require_POST
+
+
+@_require_POST
+def position_price_extraction_upload(request):
+    """
+    API: Upload extraction rows to equity price table with src_system = POSITION_UPLOAD.
+    POST JSON body: { "rows": [ {security_label, currency_code, price_date,
+                                  market_value, quantity, isin}, ... ] }
+    Returns JSON: {success_count, failure_count, failures}
+    """
+    from django.http import JsonResponse
+    try:
+        body = json.loads(request.body)
+        rows = body.get('rows', [])
+        if not rows:
+            return JsonResponse({'error': 'No rows provided'}, status=400)
+        username = request.session.get('user_login', 'SYSTEM')
+        result = position_price_extraction_service.upload_rows(rows, username=username)
+        return JsonResponse(result)
+    except json.JSONDecodeError:
+        return JsonResponse({'error': 'Invalid JSON body'}, status=400)
+    except Exception as e:
+        _logger.error("position_price_extraction_upload error: %s", e)
+        return JsonResponse({'error': 'Upload failed. Please try again.'}, status=500)
