@@ -159,8 +159,8 @@ def _export_csv(positions):
 
     writer = csv.writer(response)
     writer.writerow([
-        'Account Group', 'Portfolio Entity Group', 'Portfolio', 'Portfolio Currency',
-        'Portfolio Investment Type', 'Security', 'Security Currency', 'Security Quoted/Unquoted',
+        'Account Group', 'Entity Group', 'Portfolio', 'Portfolio Currency',
+        'Investment Type', 'Security', 'Security Currency', 'Quoted/Unquotwd',
         'ISIN', 'Position Basis', 'Position Date',
         'Src System', 'Position Type', 'Quantity',
         'Avg Cost FC', 'Avg Cost LC', 'Cost FC', 'Cost LC',
