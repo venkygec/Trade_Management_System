@@ -2477,6 +2477,364 @@ class UploadService:
         'cis_user_sta_adhoc_position_5',
     }
 
+    def supports_partial_position_upload(self, src_id: str) -> bool:
+        """Return True when this ETL source supports opt-in partial mode."""
+        return (src_id or '').lower().split('.')[-1] in self.POSITION_TARGET_TABLES
+
+    def get_position_reconciliation_mode(self, src_id: str, partial_upload: bool = False) -> str:
+        """Return FULL (default) or PARTIAL for the current ETL source."""
+        return 'PARTIAL' if partial_upload and self.supports_partial_position_upload(src_id) else 'FULL'
+
+    @staticmethod
+    def _sql_literal(value: Any) -> str:
+        """Escape a value for embedding in an Impala single-quoted literal."""
+        if value is None or str(value).strip() == '':
+            return 'NULL'
+        s = str(value).replace('’', "'").replace('‘', "'").replace('ʼ', "'")
+        s = s.replace("\\", "\\\\")
+        return "'" + s.replace("'", "\\'") + "'"
+
+    @staticmethod
+    def _sql_decimal(value: Any, dec_type: str = 'DECIMAL(30,8)', default: str = '0') -> str:
+        """Return a DECIMAL literal with NULL/blank fallback."""
+        if value is None or str(value).strip() == '':
+            return f'CAST({default} AS {dec_type})'
+        return f'CAST({str(value).strip()} AS {dec_type})'
+
+    def _find_authoritative_missing_positions(
+        self,
+        *,
+        db: str,
+        staging_table: str,
+    ) -> List[Dict[str, Any]]:
+        """Return latest prior positions in scope that are absent from the incoming snapshot."""
+        from core.repositories.impala_connection import impala_manager
+
+        query = f"""
+            WITH incoming_scope AS (
+                SELECT DISTINCT
+                    COALESCE(valid_portfolio, portfolio) AS portfolio,
+                    position_basis,
+                    CAST(reporting_date AS STRING) AS reporting_date,
+                    src_system
+                FROM {staging_table}
+                WHERE COALESCE(valid_portfolio, portfolio) IS NOT NULL
+                  AND TRIM(COALESCE(valid_portfolio, portfolio)) != ''
+                  AND position_basis IS NOT NULL
+                  AND TRIM(position_basis) != ''
+                  AND reporting_date IS NOT NULL
+                  AND CAST(reporting_date AS STRING) != ''
+                  AND portfolio_status = 'PASS'
+            ),
+            incoming_presence AS (
+                SELECT DISTINCT
+                    COALESCE(valid_portfolio, portfolio) AS portfolio,
+                    position_basis,
+                    CAST(reporting_date AS STRING) AS reporting_date,
+                    src_system,
+                    NULLIF(TRIM(COALESCE(final_isin, isin)), '') AS incoming_isin,
+                    NULLIF(TRIM(COALESCE(
+                        matched_security_name,
+                        security_full_name,
+                        security_short_name
+                    )), '') AS incoming_security_label
+                FROM {staging_table}
+                WHERE COALESCE(valid_portfolio, portfolio) IS NOT NULL
+                  AND TRIM(COALESCE(valid_portfolio, portfolio)) != ''
+                  AND position_basis IS NOT NULL
+                  AND TRIM(position_basis) != ''
+                  AND reporting_date IS NOT NULL
+                  AND CAST(reporting_date AS STRING) != ''
+                  AND portfolio_status = 'PASS'
+            ),
+            prior_ranked AS (
+                SELECT
+                    s.portfolio AS scope_portfolio,
+                    s.position_basis AS scope_position_basis,
+                    s.reporting_date AS scope_reporting_date,
+                    s.src_system AS scope_src_system,
+                    p.portfolio,
+                    p.security_label,
+                    p.position_basis,
+                    p.position_date,
+                    p.src_system,
+                    p.processing_date,
+                    p.isin,
+                    p.source_table,
+                    p.realized_pnl_fc,
+                    p.realized_pnl_lc,
+                    p.provision_fc,
+                    p.provision_lc,
+                    p.dividend_fc,
+                    p.dividend_lc,
+                    p.uncall_fc,
+                    p.uncall_lc,
+                    p.pipeline_fc,
+                    p.pipeline_lc,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            s.portfolio,
+                            s.position_basis,
+                            s.reporting_date,
+                            s.src_system,
+                            p.security_label
+                        ORDER BY
+                            CAST(p.position_date AS STRING) DESC,
+                            COALESCE(p.version_id, CAST(0 AS BIGINT)) DESC
+                    ) AS rn
+                FROM incoming_scope s
+                JOIN {db}.cis_position p
+                  ON p.portfolio = s.portfolio
+                 AND p.position_basis = s.position_basis
+                 AND p.src_system = s.src_system
+                 AND CAST(p.position_date AS STRING) <= s.reporting_date
+                 AND (p.is_latest = true OR p.is_latest IS NULL)
+                 AND COALESCE(CAST(p.quantity AS DECIMAL(30,8)), CAST(0 AS DECIMAL(30,8))) != CAST(0 AS DECIMAL(30,8))
+            )
+            SELECT
+                p.portfolio,
+                p.security_label,
+                p.position_basis,
+                p.position_date AS previous_position_date,
+                p.scope_reporting_date AS close_position_date,
+                p.src_system,
+                p.processing_date AS previous_processing_date,
+                p.isin,
+                p.source_table,
+                p.realized_pnl_fc,
+                p.realized_pnl_lc,
+                p.provision_fc,
+                p.provision_lc,
+                p.dividend_fc,
+                p.dividend_lc,
+                p.uncall_fc,
+                p.uncall_lc,
+                p.pipeline_fc,
+                p.pipeline_lc
+            FROM prior_ranked p
+            LEFT JOIN incoming_presence i_isin
+              ON i_isin.portfolio = p.scope_portfolio
+             AND i_isin.position_basis = p.scope_position_basis
+             AND i_isin.reporting_date = p.scope_reporting_date
+             AND i_isin.src_system = p.scope_src_system
+             AND i_isin.incoming_isin IS NOT NULL
+             AND p.isin IS NOT NULL
+             AND TRIM(p.isin) != ''
+             AND i_isin.incoming_isin = TRIM(p.isin)
+            LEFT JOIN incoming_presence i_name
+              ON i_name.portfolio = p.scope_portfolio
+             AND i_name.position_basis = p.scope_position_basis
+             AND i_name.reporting_date = p.scope_reporting_date
+             AND i_name.src_system = p.scope_src_system
+             AND i_name.incoming_security_label IS NOT NULL
+             AND i_name.incoming_security_label = p.security_label
+            WHERE p.rn = 1
+              AND i_isin.portfolio IS NULL
+              AND i_name.portfolio IS NULL
+            ORDER BY p.scope_reporting_date, p.portfolio, p.position_basis, p.security_label
+        """
+        return impala_manager.execute_query(query, database=db) or []
+
+    def _upsert_authoritative_close_rows(
+        self,
+        *,
+        db: str,
+        rows: List[Dict[str, Any]],
+        processing_date: str,
+    ) -> int:
+        """Write zero-quantity closure rows for positions absent from an authoritative snapshot."""
+        from core.repositories.impala_connection import impala_manager
+
+        if not rows:
+            return 0
+
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        values = []
+        for row in rows:
+            portfolio = row.get('portfolio')
+            security = row.get('security_label')
+            basis = row.get('position_basis')
+            position_date = str(row.get('close_position_date') or '')[:10]
+            src_system = row.get('src_system')
+            pos_id = (
+                "ABS(CAST(fnv_hash(CONCAT_WS('|', "
+                f"{self._sql_literal(portfolio)}, "
+                f"{self._sql_literal(security)}, "
+                f"{self._sql_literal(basis)}, "
+                f"{self._sql_literal(position_date)}, "
+                f"{self._sql_literal(src_system)}"
+                ")) AS BIGINT))"
+            )
+            values.append(
+                f"""(
+                    {pos_id},
+                    CAST(UNIX_TIMESTAMP() * 1000 AS BIGINT),
+                    {self._sql_literal(portfolio)},
+                    {self._sql_literal(security)},
+                    {self._sql_literal(basis)},
+                    {self._sql_literal(position_date)},
+                    {self._sql_literal(src_system)},
+                    {self._sql_literal(processing_date)},
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    {self._sql_decimal(row.get('provision_lc'))},
+                    {self._sql_decimal(row.get('provision_fc'))},
+                    {self._sql_decimal(row.get('dividend_fc'))},
+                    {self._sql_decimal(row.get('dividend_lc'))},
+                    {self._sql_decimal(row.get('realized_pnl_fc'))},
+                    {self._sql_decimal(row.get('realized_pnl_lc'))},
+                    {self._sql_literal(row.get('isin'))},
+                    CAST(0 AS DECIMAL(30,8)),
+                    {self._sql_literal(row.get('source_table'))},
+                    {self._sql_literal(timestamp)},
+                    {self._sql_decimal(row.get('uncall_fc'))},
+                    {self._sql_decimal(row.get('uncall_lc'))},
+                    {self._sql_decimal(row.get('pipeline_fc'))},
+                    {self._sql_decimal(row.get('pipeline_lc'))},
+                    'INT',
+                    true
+                )"""
+            )
+
+        impala_manager.execute_write(
+            f"""
+            UPSERT INTO {db}.cis_position (
+                position_id,
+                version_id,
+                portfolio,
+                security_label,
+                position_basis,
+                position_date,
+                src_system,
+                processing_date,
+                quantity,
+                average_cost_fc,
+                cost_fc,
+                market_value_fc,
+                net_book_value_fc,
+                unrealized_pnl_fc,
+                cost_lc,
+                market_value_lc,
+                net_book_value_lc,
+                unrealized_pnl_lc,
+                provision_lc,
+                provision_fc,
+                dividend_fc,
+                dividend_lc,
+                realized_pnl_fc,
+                realized_pnl_lc,
+                isin,
+                average_cost_lc,
+                source_table,
+                processing_timestamp,
+                uncall_fc,
+                uncall_lc,
+                pipeline_fc,
+                pipeline_lc,
+                position_type,
+                is_latest
+            ) VALUES {', '.join(values)}
+            """,
+            database=db
+        )
+        return len(rows)
+
+    def _carry_forward_authoritative_close_rows(
+        self,
+        *,
+        db: str,
+        rows: List[Dict[str, Any]],
+        processing_date: str,
+    ) -> int:
+        """Carry backdated zero-quantity closure rows forward like normal USER_UPLOAD INT rows."""
+        from datetime import date as _calendar_date
+        from core.repositories.impala_connection import impala_manager
+
+        backdated_rows = [
+            row for row in rows
+            if (row.get('src_system') == 'USER_UPLOAD'
+                and str(row.get('close_position_date') or '')[:10] < _calendar_date.today().isoformat())
+        ]
+        if not backdated_rows:
+            return 0
+
+        min_close_date = min(str(row.get('close_position_date') or '')[:10] for row in backdated_rows)
+        if not min_close_date:
+            return 0
+
+        today_iso = _calendar_date.today().isoformat()
+        min_close_key = min_close_date.replace('-', '')
+        today_key = today_iso.replace('-', '')
+        biz_dates_rows = impala_manager.execute_query(
+            f"""
+            SELECT contextual_today AS biz_date
+            FROM {db}.gmp_cis_sta_dly_alldatesinfo
+            WHERE src_system = 'gmp'
+              AND sub_system  = 'cis'
+              AND data_frq    = 'dly'
+              AND record_type = 'D'
+              AND CAST(contextual_today AS BIGINT) > {min_close_key}
+              AND CAST(contextual_today AS BIGINT) <= {today_key}
+            ORDER BY contextual_today ASC
+            """,
+            database=db
+        ) or []
+
+        def _to_iso(value: Any) -> str:
+            raw = str(value).strip()[:10].replace('-', '').replace('/', '')
+            if len(raw) == 8 and raw.isdigit():
+                return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+            return str(value)[:10]
+
+        biz_dates = [_to_iso(row.get('biz_date')) for row in biz_dates_rows if row.get('biz_date')]
+        carried = 0
+
+        for row in backdated_rows:
+            portfolio = row.get('portfolio', '')
+            security = row.get('security_label', '')
+            basis = row.get('position_basis', '')
+            upload_date = str(row.get('close_position_date') or '')[:10]
+            if not portfolio or not security or not upload_date:
+                continue
+
+            for biz_date in biz_dates:
+                if biz_date <= upload_date:
+                    continue
+                exists_rows = impala_manager.execute_query(
+                    f"""
+                    SELECT COUNT(*) AS cnt
+                    FROM {db}.cis_position
+                    WHERE portfolio       = {self._sql_literal(portfolio)}
+                      AND security_label  = {self._sql_literal(security)}
+                      AND position_basis  = {self._sql_literal(basis)}
+                      AND src_system      = 'USER_UPLOAD'
+                      AND CAST(position_date AS STRING) = {self._sql_literal(biz_date)}
+                      AND (is_latest = true OR is_latest IS NULL)
+                    """,
+                    database=db
+                ) or [{}]
+                if int(exists_rows[0].get('cnt', 0) or 0) > 0:
+                    break
+
+                carry_row = dict(row)
+                carry_row['close_position_date'] = biz_date
+                self._upsert_authoritative_close_rows(
+                    db=db,
+                    rows=[carry_row],
+                    processing_date=processing_date,
+                )
+                carried += 1
+
+        return carried
+
     def is_position_upload(self, upload: Dict[str, Any]) -> bool:
         """Return True if this upload's target table is one of the 5 position sources."""
         target = (upload.get('target_table_name') or '').lower().split('.')[-1]
@@ -2488,7 +2846,8 @@ class UploadService:
         src_id: str,
         processing_date: str,
         updated_by: str,
-        auto_create_security: bool = False
+        auto_create_security: bool = False,
+        partial_upload: bool = False,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
         Execute the position upload transform pipeline for a given partition.
@@ -2518,6 +2877,8 @@ class UploadService:
             src_id:    Source partition value (e.g. 'cis_user_sta_adhoc_position_1')
             processing_date: YYYYMMDD partition value
             updated_by: Username triggering the ETL
+            partial_upload: When True on user-upload sources, skip authoritative
+                missing-position closure and treat the file as a partial patch.
 
         Returns:
             Tuple of (success, message, result_dict)
@@ -2552,6 +2913,11 @@ class UploadService:
             })
 
             db = settings.IMPALA_CONFIG['DATABASE']
+            reconciliation_mode = self.get_position_reconciliation_mode(
+                src_id, partial_upload=partial_upload
+            )
+            result['reconciliation_mode'] = reconciliation_mode
+            result['partial_upload'] = reconciliation_mode == 'PARTIAL'
 
             # Namespaces every pos_stage_* staging table by upload_id so two
             # concurrent ETL runs never collide on the same physical Kudu
@@ -5555,6 +5921,38 @@ class UploadService:
             result['cis_position_rows'] = max(_s7a_upserted, 0)
             logger.info(f"[position_etl] Step 7A complete — {_s7a_upserted} is_latest=true rows in cis_position for this run")
             _t = _step_time("Step 7A (cis_position upsert)", _t)
+
+            result['closed_positions'] = 0
+            result['closed_positions_carried_forward'] = 0
+            if reconciliation_mode == 'FULL':
+                _missing_rows = self._find_authoritative_missing_positions(
+                    db=db,
+                    staging_table=f'position_upload_staging_{ETL_SFX}',
+                )
+                if _missing_rows:
+                    _closed_now = self._upsert_authoritative_close_rows(
+                        db=db,
+                        rows=_missing_rows,
+                        processing_date=processing_date,
+                    )
+                    result['closed_positions'] = _closed_now
+                    try:
+                        _hive_refresh_table('gmp_cis_sta_dly_alldatesinfo', "Authoritative carry-forward")
+                    except Exception:
+                        pass
+                    result['closed_positions_carried_forward'] = self._carry_forward_authoritative_close_rows(
+                        db=db,
+                        rows=_missing_rows,
+                        processing_date=processing_date,
+                    )
+                    logger.info(
+                        f"[position_etl] Authoritative reconciliation: closed {_closed_now} missing "
+                        f"position(s), carried {result['closed_positions_carried_forward']} forward"
+                    )
+                else:
+                    logger.info("[position_etl] Authoritative reconciliation: no missing positions to close")
+            else:
+                logger.info("[position_etl] Partial upload mode: authoritative missing-position closure skipped")
 
             # ------------------------------------------------------------------
             # Step 7A2: For backdated uploads (reporting_date < today), carry the

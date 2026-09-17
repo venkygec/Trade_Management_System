@@ -763,6 +763,106 @@ class UploadServiceTestCase(TestCase):
     def test_is_position_upload_empty_target(self):
         self.assertFalse(self.svc.is_position_upload({'target_table_name': ''}))
 
+    def test_position_reconciliation_mode_defaults_to_full(self):
+        mode = self.svc.get_position_reconciliation_mode(
+            'cis_user_sta_adhoc_position_5',
+            partial_upload=False,
+        )
+        self.assertEqual(mode, 'FULL')
+
+    def test_position_reconciliation_mode_allows_partial_only_for_user_uploads(self):
+        self.assertEqual(
+            self.svc.get_position_reconciliation_mode(
+                'cis_user_sta_adhoc_position_5',
+                partial_upload=True,
+            ),
+            'PARTIAL'
+        )
+        self.assertEqual(
+            self.svc.get_position_reconciliation_mode(
+                'gmp_cis_sta_dly_position',
+                partial_upload=True,
+            ),
+            'FULL'
+        )
+
+
+class UploadServiceAuthoritativeCloseTestCase(TestCase):
+
+    def setUp(self):
+        self.mock_repo = patch('upload.services.upload_service.upload_kudu_repository').start()
+        from upload.services.upload_service import UploadService
+        self.svc = UploadService()
+        self.addCleanup(patch.stopall)
+
+    def test_upsert_authoritative_close_rows_writes_zero_quantity(self):
+        rows = [{
+            'portfolio': 'PORT-1',
+            'security_label': 'AAPL US',
+            'position_basis': 'SETTLED',
+            'close_position_date': '2026-09-17',
+            'src_system': 'USER_UPLOAD',
+            'isin': 'US0378331005',
+            'source_table': 'cis_user_sta_adhoc_position_5',
+            'realized_pnl_fc': '12.34',
+            'realized_pnl_lc': '16.78',
+            'provision_fc': '1.10',
+            'provision_lc': '1.50',
+            'dividend_fc': '2.20',
+            'dividend_lc': '3.00',
+            'uncall_fc': '4.40',
+            'uncall_lc': '5.50',
+            'pipeline_fc': '6.60',
+            'pipeline_lc': '7.70',
+        }]
+
+        with patch('core.repositories.impala_connection.impala_manager') as mock_impala:
+            mock_impala.execute_write.return_value = True
+            closed = self.svc._upsert_authoritative_close_rows(
+                db='gmp_cis',
+                rows=rows,
+                processing_date='20260917',
+            )
+
+        self.assertEqual(closed, 1)
+        sql = mock_impala.execute_write.call_args.args[0]
+        self.assertIn("UPSERT INTO gmp_cis.cis_position", sql)
+        self.assertIn("'PORT-1'", sql)
+        self.assertIn("'AAPL US'", sql)
+        self.assertIn("CAST(0 AS DECIMAL(30,8))", sql)
+        self.assertIn("'USER_UPLOAD'", sql)
+        self.assertIn("'cis_user_sta_adhoc_position_5'", sql)
+        self.assertIn("CAST(12.34 AS DECIMAL(30,8))", sql)
+
+    def test_carry_forward_authoritative_close_rows_stops_at_existing_future_row(self):
+        rows = [{
+            'portfolio': 'PORT-1',
+            'security_label': 'AAPL US',
+            'position_basis': 'SETTLED',
+            'close_position_date': '2026-01-01',
+            'src_system': 'USER_UPLOAD',
+            'isin': 'US0378331005',
+            'source_table': 'cis_user_sta_adhoc_position_5',
+        }]
+
+        with patch('core.repositories.impala_connection.impala_manager') as mock_impala:
+            mock_impala.execute_query.side_effect = [
+                [{'biz_date': '20260102'}, {'biz_date': '20260103'}],
+                [{'cnt': 0}],
+                [{'cnt': 1}],
+            ]
+            self.svc._upsert_authoritative_close_rows = MagicMock(return_value=1)
+            carried = self.svc._carry_forward_authoritative_close_rows(
+                db='gmp_cis',
+                rows=rows,
+                processing_date='20260917',
+            )
+
+        self.assertEqual(carried, 1)
+        self.svc._upsert_authoritative_close_rows.assert_called_once()
+        carry_rows = self.svc._upsert_authoritative_close_rows.call_args.kwargs['rows']
+        self.assertEqual(carry_rows[0]['close_position_date'], '2026-01-02')
+
 
 # ===========================================================================
 # UploadService — validate_file delegates correctly

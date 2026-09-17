@@ -1521,6 +1521,7 @@ def run_position_etl(request, upload_id: str):
     processing_date = request.POST.get('processing_date', '').strip()
     # Checkbox: present in POST (value 'on') when checked, absent when unchecked.
     auto_create_security = 'auto_create_security' in request.POST
+    partial_upload = 'partial_upload' in request.POST
 
     if not processing_date:
         # Try to read from description
@@ -1554,6 +1555,7 @@ def run_position_etl(request, upload_id: str):
     _src_id     = src_id
     _proc_date  = processing_date
     _auto_create_security = auto_create_security
+    _partial_upload = partial_upload
 
     def _do_etl():
         import logging as _logging
@@ -1582,6 +1584,7 @@ def run_position_etl(request, upload_id: str):
                 processing_date=_proc_date,
                 updated_by=_username,
                 auto_create_security=_auto_create_security,
+                partial_upload=_partial_upload,
             )
             # Read current record to preserve user's original description
             _rec = upload_service.repository.get_upload_by_id(upload_id)
@@ -1599,6 +1602,16 @@ def run_position_etl(request, upload_id: str):
                 _etl_note = (
                     f"Position ETL: {_cis_rows}/{_total} rows → cis_position"
                     + (f" | {_failed} failed validation (see Download Report)" if _failed else "")
+                    + (
+                        f" | {result.get('closed_positions', 0)} position(s) auto-closed"
+                        if result.get('reconciliation_mode') == 'FULL' and result.get('closed_positions', 0)
+                        else ""
+                    )
+                    + (
+                        " | partial mode"
+                        if result.get('reconciliation_mode') == 'PARTIAL'
+                        else ""
+                    )
                 )
                 _new_desc = f"{_orig_desc}\n{_etl_note}".strip() if _orig_desc else _etl_note
                 upload_service.repository.update_upload(
