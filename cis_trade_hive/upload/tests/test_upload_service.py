@@ -770,20 +770,13 @@ class UploadServiceTestCase(TestCase):
         )
         self.assertEqual(mode, 'FULL')
 
-    def test_position_reconciliation_mode_allows_partial_only_for_user_uploads(self):
+    def test_position_reconciliation_mode_returns_partial_when_checkbox_selected(self):
         self.assertEqual(
             self.svc.get_position_reconciliation_mode(
                 'cis_user_sta_adhoc_position_5',
                 partial_upload=True,
             ),
             'PARTIAL'
-        )
-        self.assertEqual(
-            self.svc.get_position_reconciliation_mode(
-                'gmp_cis_sta_dly_position',
-                partial_upload=True,
-            ),
-            'FULL'
         )
 
 

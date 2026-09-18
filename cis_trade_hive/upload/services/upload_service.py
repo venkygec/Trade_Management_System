@@ -2477,13 +2477,9 @@ class UploadService:
         'cis_user_sta_adhoc_position_5',
     }
 
-    def supports_partial_position_upload(self, src_id: str) -> bool:
-        """Return True when this ETL source supports opt-in partial mode."""
-        return (src_id or '').lower().split('.')[-1] in self.POSITION_TARGET_TABLES
-
-    def get_position_reconciliation_mode(self, src_id: str, partial_upload: bool = False) -> str:
+    def get_position_reconciliation_mode(self, _src_id: str, partial_upload: bool = False) -> str:
         """Return FULL (default) or PARTIAL for the current ETL source."""
-        return 'PARTIAL' if partial_upload and self.supports_partial_position_upload(src_id) else 'FULL'
+        return 'PARTIAL' if partial_upload else 'FULL'
 
     @staticmethod
     def _sql_literal(value: Any) -> str:
@@ -2816,8 +2812,8 @@ class UploadService:
             src_id:    Source partition value (e.g. 'cis_user_sta_adhoc_position_1')
             processing_date: YYYYMMDD partition value
             updated_by: Username triggering the ETL
-            partial_upload: When True on user-upload sources, skip authoritative
-                missing-position closure and treat the file as a partial patch.
+            partial_upload: When True, keep the existing upload behavior and skip
+                the new authoritative missing-position closure path.
 
         Returns:
             Tuple of (success, message, result_dict)
