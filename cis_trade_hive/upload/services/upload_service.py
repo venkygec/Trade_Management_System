@@ -2494,13 +2494,6 @@ class UploadService:
         s = s.replace("\\", "\\\\")
         return "'" + s.replace("'", "\\'") + "'"
 
-    @staticmethod
-    def _sql_decimal(value: Any, dec_type: str = 'DECIMAL(30,8)', default: str = '0') -> str:
-        """Return a DECIMAL literal with NULL/blank fallback."""
-        if value is None or str(value).strip() == '':
-            return f'CAST({default} AS {dec_type})'
-        return f'CAST({str(value).strip()} AS {dec_type})'
-
     def _find_authoritative_missing_positions(
         self,
         *,
@@ -2526,51 +2519,18 @@ class UploadService:
                   AND CAST(reporting_date AS STRING) != ''
                   AND portfolio_status = 'PASS'
             ),
-            incoming_presence AS (
-                SELECT DISTINCT
-                    COALESCE(valid_portfolio, portfolio) AS portfolio,
-                    position_basis,
-                    CAST(reporting_date AS STRING) AS reporting_date,
-                    src_system,
-                    NULLIF(TRIM(COALESCE(final_isin, isin)), '') AS incoming_isin,
-                    NULLIF(TRIM(COALESCE(
-                        matched_security_name,
-                        security_full_name,
-                        security_short_name
-                    )), '') AS incoming_security_label
-                FROM {staging_table}
-                WHERE COALESCE(valid_portfolio, portfolio) IS NOT NULL
-                  AND TRIM(COALESCE(valid_portfolio, portfolio)) != ''
-                  AND position_basis IS NOT NULL
-                  AND TRIM(position_basis) != ''
-                  AND reporting_date IS NOT NULL
-                  AND CAST(reporting_date AS STRING) != ''
-                  AND portfolio_status = 'PASS'
-            ),
             prior_ranked AS (
                 SELECT
-                    s.portfolio AS scope_portfolio,
-                    s.position_basis AS scope_position_basis,
-                    s.reporting_date AS scope_reporting_date,
-                    s.src_system AS scope_src_system,
+                    s.portfolio,
+                    s.position_basis,
+                    s.reporting_date,
+                    s.src_system,
                     p.portfolio,
                     p.security_label,
                     p.position_basis,
                     p.position_date,
                     p.src_system,
-                    p.processing_date,
-                    p.isin,
                     p.source_table,
-                    p.realized_pnl_fc,
-                    p.realized_pnl_lc,
-                    p.provision_fc,
-                    p.provision_lc,
-                    p.dividend_fc,
-                    p.dividend_lc,
-                    p.uncall_fc,
-                    p.uncall_lc,
-                    p.pipeline_fc,
-                    p.pipeline_lc,
                     ROW_NUMBER() OVER (
                         PARTITION BY
                             s.portfolio,
@@ -2596,42 +2556,21 @@ class UploadService:
                 p.security_label,
                 p.position_basis,
                 p.position_date AS previous_position_date,
-                p.scope_reporting_date AS close_position_date,
+                p.reporting_date AS close_position_date,
                 p.src_system,
-                p.processing_date AS previous_processing_date,
-                p.isin,
-                p.source_table,
-                p.realized_pnl_fc,
-                p.realized_pnl_lc,
-                p.provision_fc,
-                p.provision_lc,
-                p.dividend_fc,
-                p.dividend_lc,
-                p.uncall_fc,
-                p.uncall_lc,
-                p.pipeline_fc,
-                p.pipeline_lc
+                p.source_table
             FROM prior_ranked p
-            LEFT JOIN incoming_presence i_isin
-              ON i_isin.portfolio = p.scope_portfolio
-             AND i_isin.position_basis = p.scope_position_basis
-             AND i_isin.reporting_date = p.scope_reporting_date
-             AND i_isin.src_system = p.scope_src_system
-             AND i_isin.incoming_isin IS NOT NULL
-             AND p.isin IS NOT NULL
-             AND TRIM(p.isin) != ''
-             AND i_isin.incoming_isin = TRIM(p.isin)
-            LEFT JOIN incoming_presence i_name
-              ON i_name.portfolio = p.scope_portfolio
-             AND i_name.position_basis = p.scope_position_basis
-             AND i_name.reporting_date = p.scope_reporting_date
-             AND i_name.src_system = p.scope_src_system
-             AND i_name.incoming_security_label IS NOT NULL
-             AND i_name.incoming_security_label = p.security_label
             WHERE p.rn = 1
-              AND i_isin.portfolio IS NULL
-              AND i_name.portfolio IS NULL
-            ORDER BY p.scope_reporting_date, p.portfolio, p.position_basis, p.security_label
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {staging_table} s
+                  WHERE COALESCE(s.valid_portfolio, s.portfolio) = p.portfolio
+                    AND s.position_basis = p.position_basis
+                    AND CAST(s.reporting_date AS STRING) = p.reporting_date
+                    AND s.src_system = p.src_system
+                    AND s.matched_security_name = p.security_label
+              )
+            ORDER BY p.reporting_date, p.portfolio, p.position_basis, p.security_label
         """
         return impala_manager.execute_query(query, database=db) or []
 
@@ -2685,20 +2624,20 @@ class UploadService:
                     CAST(0 AS DECIMAL(30,8)),
                     CAST(0 AS DECIMAL(30,8)),
                     CAST(0 AS DECIMAL(30,8)),
-                    {self._sql_decimal(row.get('provision_lc'))},
-                    {self._sql_decimal(row.get('provision_fc'))},
-                    {self._sql_decimal(row.get('dividend_fc'))},
-                    {self._sql_decimal(row.get('dividend_lc'))},
-                    {self._sql_decimal(row.get('realized_pnl_fc'))},
-                    {self._sql_decimal(row.get('realized_pnl_lc'))},
-                    {self._sql_literal(row.get('isin'))},
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    NULL,
                     CAST(0 AS DECIMAL(30,8)),
                     {self._sql_literal(row.get('source_table'))},
                     {self._sql_literal(timestamp)},
-                    {self._sql_decimal(row.get('uncall_fc'))},
-                    {self._sql_decimal(row.get('uncall_lc'))},
-                    {self._sql_decimal(row.get('pipeline_fc'))},
-                    {self._sql_decimal(row.get('pipeline_lc'))},
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
                     'INT',
                     true
                 )"""

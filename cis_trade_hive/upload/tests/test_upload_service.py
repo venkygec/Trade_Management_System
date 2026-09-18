@@ -795,6 +795,20 @@ class UploadServiceAuthoritativeCloseTestCase(TestCase):
         self.svc = UploadService()
         self.addCleanup(patch.stopall)
 
+    def test_find_authoritative_missing_positions_uses_only_mapped_security_name(self):
+        with patch('core.repositories.impala_connection.impala_manager') as mock_impala:
+            mock_impala.execute_query.return_value = []
+            self.svc._find_authoritative_missing_positions(
+                db='gmp_cis',
+                staging_table='position_upload_staging_test',
+            )
+
+        sql = mock_impala.execute_query.call_args.args[0]
+        self.assertIn("AND s.matched_security_name = p.security_label", sql)
+        self.assertNotIn("final_isin", sql)
+        self.assertNotIn("security_full_name", sql)
+        self.assertNotIn("security_short_name", sql)
+
     def test_upsert_authoritative_close_rows_writes_zero_quantity(self):
         rows = [{
             'portfolio': 'PORT-1',
@@ -802,18 +816,7 @@ class UploadServiceAuthoritativeCloseTestCase(TestCase):
             'position_basis': 'SETTLED',
             'close_position_date': '2026-09-17',
             'src_system': 'USER_UPLOAD',
-            'isin': 'US0378331005',
             'source_table': 'cis_user_sta_adhoc_position_5',
-            'realized_pnl_fc': '12.34',
-            'realized_pnl_lc': '16.78',
-            'provision_fc': '1.10',
-            'provision_lc': '1.50',
-            'dividend_fc': '2.20',
-            'dividend_lc': '3.00',
-            'uncall_fc': '4.40',
-            'uncall_lc': '5.50',
-            'pipeline_fc': '6.60',
-            'pipeline_lc': '7.70',
         }]
 
         with patch('core.repositories.impala_connection.impala_manager') as mock_impala:
@@ -832,7 +835,8 @@ class UploadServiceAuthoritativeCloseTestCase(TestCase):
         self.assertIn("CAST(0 AS DECIMAL(30,8))", sql)
         self.assertIn("'USER_UPLOAD'", sql)
         self.assertIn("'cis_user_sta_adhoc_position_5'", sql)
-        self.assertIn("CAST(12.34 AS DECIMAL(30,8))", sql)
+        self.assertIn("NULL,", sql)
+        self.assertNotIn("12.34", sql)
 
     def test_carry_forward_authoritative_close_rows_stops_at_existing_future_row(self):
         rows = [{
