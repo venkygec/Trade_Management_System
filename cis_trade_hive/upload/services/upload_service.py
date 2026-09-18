@@ -2579,6 +2579,7 @@ class UploadService:
     ) -> int:
         """Write zero-quantity closure rows for positions absent from an authoritative snapshot."""
         from core.repositories.impala_connection import impala_manager
+        from trade.services.position_id_service import position_id as calc_position_id
 
         if not rows:
             return 0
@@ -2591,14 +2592,12 @@ class UploadService:
             basis = row.get('position_basis')
             position_date = str(row.get('close_position_date') or '')[:10]
             src_system = row.get('src_system')
-            pos_id = (
-                "ABS(CAST(fnv_hash(CONCAT_WS('|', "
-                f"{self._sql_literal(portfolio)}, "
-                f"{self._sql_literal(security)}, "
-                f"{self._sql_literal(basis)}, "
-                f"{self._sql_literal(position_date)}, "
-                f"{self._sql_literal(src_system)}"
-                ")) AS BIGINT))"
+            pos_id = calc_position_id(
+                portfolio=portfolio,
+                security_label=security,
+                position_basis=basis,
+                position_date=position_date,
+                src_system=src_system,
             )
             values.append(
                 f"""(

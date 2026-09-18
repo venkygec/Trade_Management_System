@@ -803,6 +803,8 @@ class UploadServiceAuthoritativeCloseTestCase(TestCase):
         self.assertNotIn("security_short_name", sql)
 
     def test_upsert_authoritative_close_rows_writes_zero_quantity(self):
+        from trade.services.position_id_service import position_id as calc_position_id
+
         rows = [{
             'portfolio': 'PORT-1',
             'security_label': 'AAPL US',
@@ -822,7 +824,9 @@ class UploadServiceAuthoritativeCloseTestCase(TestCase):
 
         self.assertEqual(closed, 1)
         sql = mock_impala.execute_write.call_args.args[0]
+        expected_position_id = calc_position_id('PORT-1', 'AAPL US', 'SETTLED', '2026-09-17', 'USER_UPLOAD')
         self.assertIn("UPSERT INTO gmp_cis.cis_position", sql)
+        self.assertIn(f"{expected_position_id},", sql)
         self.assertIn("'PORT-1'", sql)
         self.assertIn("'AAPL US'", sql)
         self.assertIn("CAST(0 AS DECIMAL(30,8))", sql)
