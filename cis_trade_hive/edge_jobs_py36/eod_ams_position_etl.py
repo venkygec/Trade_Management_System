@@ -57,6 +57,10 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from lib.impala_connection import impala_manager  # noqa: E402
+from lib.position_id_service import (  # noqa: E402
+    position_id as calc_position_id,
+    position_id_sql_expr,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -299,13 +303,7 @@ def _carry_forward_backdated_positions(processing_date):
                     uncall_fc, uncall_lc, pipeline_fc, pipeline_lc, position_type, is_latest
                 )
                 SELECT
-                    ABS(CAST(fnv_hash(CONCAT_WS('|',
-                        COALESCE(portfolio, ''),
-                        COALESCE(security_label, ''),
-                        COALESCE(position_basis, ''),
-                        '{biz_date}',
-                        COALESCE(src_system, '')
-                    )) AS BIGINT))                                  AS position_id,
+                    {calc_position_id(portfolio, security, basis, biz_date, src_system)} AS position_id,
                     CAST(UNIX_TIMESTAMP() * 1000 AS BIGINT)         AS version_id,
                     portfolio,
                     security_label,
@@ -2009,13 +2007,13 @@ def run_etl_for_table(table: str, processing_date: str, dry_run: bool,
             uncall_fc, uncall_lc, pipeline_fc, pipeline_lc, position_type, is_latest
         )
         SELECT
-            ABS(CAST(fnv_hash(CONCAT_WS('|',
-                COALESCE(portfolio, ''),
-                COALESCE(COALESCE(matched_security_name, security_full_name, security_short_name), ''),
-                COALESCE(position_basis, ''),
-                COALESCE(CAST(reporting_date AS STRING), ''),
-                COALESCE(src_system, '')
-            )) AS BIGINT))                                  AS position_id,
+            {position_id_sql_expr(
+                "portfolio",
+                "COALESCE(matched_security_name, security_full_name, security_short_name)",
+                "position_basis",
+                "CAST(reporting_date AS STRING)",
+                "src_system",
+            )}                                              AS position_id,
             CAST(UNIX_TIMESTAMP() * 1000 AS BIGINT)         AS version_id,
             portfolio,
             COALESCE(matched_security_name, security_full_name, security_short_name) AS security_label,
