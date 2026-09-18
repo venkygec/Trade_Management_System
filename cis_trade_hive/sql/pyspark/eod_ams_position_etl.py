@@ -45,7 +45,7 @@ import argparse
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 
 # ---------------------------------------------------------------------------
 # Bootstrap: make the Django project importable without starting Django.
@@ -194,6 +194,181 @@ def build_average_cost_sql(
                     THEN CAST({fallback_expr} AS {dec_type})
                 ELSE CAST(0 AS {dec_type})
             END"""
+
+
+def _sql_literal(value) -> str:
+    if value is None or str(value).strip() == '':
+        return 'NULL'
+    s = str(value).replace('’', "'").replace('‘', "'").replace('ʼ', "'")
+    s = s.replace("\\", "\\\\")
+    return "'" + s.replace("'", "\\'") + "'"
+
+
+def _mark_position_rows_not_latest(*, portfolio: str, security_label: str,
+                                   position_basis: str, position_date: str,
+                                   src_system: str) -> None:
+    impala_manager.execute_write(
+        f"""
+        UPDATE {DB}.cis_position
+        SET is_latest = false
+        WHERE portfolio = {_sql_literal(portfolio)}
+          AND security_label = {_sql_literal(security_label)}
+          AND position_basis = {_sql_literal(position_basis)}
+          AND CAST(position_date AS STRING) = {_sql_literal(position_date)}
+          AND src_system = {_sql_literal(src_system)}
+          AND is_latest = true
+        """,
+        database=DB
+    )
+
+
+def _carry_forward_backdated_positions(processing_date: str) -> int:
+    calendar_today_iso = date.today().isoformat()
+    backdated_rows = impala_manager.execute_query(
+        f"""
+        SELECT
+            s.portfolio,
+            COALESCE(s.matched_security_name, s.security_full_name, s.security_short_name) AS security_label,
+            s.position_basis,
+            s.src_system,
+            MIN(CAST(s.reporting_date AS STRING)) AS upload_date
+        FROM position_upload_staging s
+        WHERE s.overall_status LIKE 'VALID%'
+          AND CAST(s.reporting_date AS STRING) < '{calendar_today_iso}'
+        GROUP BY 1, 2, 3, 4
+        """,
+        database=DB
+    ) or []
+    if not backdated_rows:
+        print("[Step 7A2] no backdated rows — carry-forward skipped")
+        return 0
+
+    print(f"[Step 7A2] {len(backdated_rows)} backdated combo(s) — carry-forward starting")
+    min_upload_date = min((row.get('upload_date', calendar_today_iso) or calendar_today_iso)[:10]
+                          for row in backdated_rows)
+    min_upload_key = min_upload_date.replace('-', '')
+    today_key = calendar_today_iso.replace('-', '')
+
+    impala_manager.execute_write(
+        f"REFRESH {DB}.gmp_cis_sta_dly_alldatesinfo",
+        database=DB
+    )
+    biz_dates_rows = impala_manager.execute_query(
+        f"""
+        SELECT contextual_today AS biz_date
+        FROM {DB}.gmp_cis_sta_dly_alldatesinfo
+        WHERE src_system = 'gmp'
+          AND sub_system  = 'cis'
+          AND data_frq    = 'dly'
+          AND record_type = 'D'
+          AND CAST(contextual_today AS BIGINT) > {min_upload_key}
+          AND CAST(contextual_today AS BIGINT) <= {today_key}
+        ORDER BY contextual_today ASC
+        """,
+        database=DB
+    ) or []
+
+    def _to_iso(value) -> str:
+        raw = str(value).strip()[:10].replace('-', '').replace('/', '')
+        if len(raw) == 8 and raw.isdigit():
+            return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+        return str(value)[:10]
+
+    biz_dates = [_to_iso(row.get('biz_date')) for row in biz_dates_rows if row.get('biz_date')]
+    carried = 0
+
+    for row in backdated_rows:
+        portfolio = row.get('portfolio', '')
+        security = row.get('security_label', '')
+        basis = row.get('position_basis', '')
+        src_system = row.get('src_system', '')
+        upload_date = str(row.get('upload_date') or '')[:10]
+        if not portfolio or not security or not basis or not src_system or not upload_date:
+            continue
+
+        for biz_date in biz_dates:
+            if biz_date <= upload_date:
+                continue
+            _mark_position_rows_not_latest(
+                portfolio=portfolio,
+                security_label=security,
+                position_basis=basis,
+                position_date=biz_date,
+                src_system=src_system,
+            )
+            carry_ok = impala_manager.execute_write(
+                f"""
+                UPSERT INTO {DB}.cis_position (
+                    position_id, version_id, portfolio, security_label, position_basis,
+                    position_date, src_system, processing_date, quantity,
+                    average_cost_fc, cost_fc, market_value_fc, net_book_value_fc, unrealized_pnl_fc,
+                    cost_lc, market_value_lc, net_book_value_lc, unrealized_pnl_lc,
+                    provision_lc, provision_fc,
+                    dividend_fc, dividend_lc, realized_pnl_fc, realized_pnl_lc,
+                    isin, average_cost_lc, source_table, processing_timestamp,
+                    uncall_fc, uncall_lc, pipeline_fc, pipeline_lc, position_type, is_latest
+                )
+                SELECT
+                    ABS(CAST(fnv_hash(CONCAT_WS('|',
+                        COALESCE(portfolio, ''),
+                        COALESCE(security_label, ''),
+                        COALESCE(position_basis, ''),
+                        '{biz_date}',
+                        COALESCE(src_system, '')
+                    )) AS BIGINT))                                  AS position_id,
+                    CAST(UNIX_TIMESTAMP() * 1000 AS BIGINT)         AS version_id,
+                    portfolio,
+                    security_label,
+                    position_basis,
+                    '{biz_date}'                                    AS position_date,
+                    src_system,
+                    '{processing_date}'                             AS processing_date,
+                    quantity,
+                    average_cost_fc,
+                    cost_fc,
+                    market_value_fc,
+                    net_book_value_fc,
+                    unrealized_pnl_fc,
+                    cost_lc,
+                    market_value_lc,
+                    net_book_value_lc,
+                    unrealized_pnl_lc,
+                    provision_lc,
+                    provision_fc,
+                    dividend_fc,
+                    dividend_lc,
+                    realized_pnl_fc,
+                    realized_pnl_lc,
+                    isin,
+                    average_cost_lc,
+                    source_table,
+                    from_unixtime(unix_timestamp(), 'yyyy-MM-dd HH:mm:ss') AS processing_timestamp,
+                    uncall_fc,
+                    uncall_lc,
+                    pipeline_fc,
+                    pipeline_lc,
+                    'INT'                                            AS position_type,
+                    true                                             AS is_latest
+                FROM {DB}.cis_position
+                WHERE portfolio       = {_sql_literal(portfolio)}
+                  AND security_label  = {_sql_literal(security)}
+                  AND position_basis  = {_sql_literal(basis)}
+                  AND src_system      = {_sql_literal(src_system)}
+                  AND CAST(position_date AS STRING) < {_sql_literal(biz_date)}
+                  AND (is_latest = true OR is_latest IS NULL)
+                ORDER BY position_date DESC
+                LIMIT 1
+                """,
+                database=DB
+            )
+            if carry_ok:
+                carried += 1
+                print(f"[Step 7A2] carried {portfolio}/{security}/{basis}/{src_system} forward to {biz_date}")
+            else:
+                print(f"[Step 7A2] WARNING carry-forward failed for {portfolio}/{security}/{basis}/{src_system} on {biz_date}")
+
+    print(f"[Step 7A2] complete — {carried} date(s) carried forward")
+    return carried
 
 
 def normalize_ticker_suffix(col: str) -> str:
@@ -1936,6 +2111,7 @@ def run_etl_for_table(table: str, processing_date: str, dry_run: bool,
         print("[Step 7A] FAILED — UPSERT into cis_position failed")
         return result
     print("[Step 7A] cis_position UPSERT complete")
+    result['carried_forward_positions'] = _carry_forward_backdated_positions(processing_date)
 
     # ---- Step 7B: INSERT OVERWRITE position_upload_report ----
     # Verify pos_stage_1_base still has rows (sanity check before writing report)
