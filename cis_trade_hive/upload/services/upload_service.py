@@ -2490,6 +2490,33 @@ class UploadService:
         s = s.replace("\\", "\\\\")
         return "'" + s.replace("'", "\\'") + "'"
 
+    def _mark_position_rows_not_latest(
+        self,
+        *,
+        db: str,
+        portfolio: str,
+        security_label: str,
+        position_basis: str,
+        position_date: str,
+        src_system: str,
+    ) -> None:
+        """Mark existing latest rows for the exact natural key/date as superseded."""
+        from core.repositories.impala_connection import impala_manager
+
+        impala_manager.execute_write(
+            f"""
+            UPDATE {db}.cis_position
+            SET is_latest = false
+            WHERE portfolio = {self._sql_literal(portfolio)}
+              AND security_label = {self._sql_literal(security_label)}
+              AND position_basis = {self._sql_literal(position_basis)}
+              AND CAST(position_date AS STRING) = {self._sql_literal(position_date)}
+              AND src_system = {self._sql_literal(src_system)}
+              AND is_latest = true
+            """,
+            database=db
+        )
+
     def _find_authoritative_missing_positions(
         self,
         *,
@@ -2736,28 +2763,21 @@ class UploadService:
             security = row.get('security_label', '')
             basis = row.get('position_basis', '')
             upload_date = str(row.get('close_position_date') or '')[:10]
+            src_system = row.get('src_system') or 'USER_UPLOAD'
             if not portfolio or not security or not upload_date:
                 continue
 
             for biz_date in biz_dates:
                 if biz_date <= upload_date:
                     continue
-                exists_rows = impala_manager.execute_query(
-                    f"""
-                    SELECT COUNT(*) AS cnt
-                    FROM {db}.cis_position
-                    WHERE portfolio       = {self._sql_literal(portfolio)}
-                      AND security_label  = {self._sql_literal(security)}
-                      AND position_basis  = {self._sql_literal(basis)}
-                      AND src_system      = 'USER_UPLOAD'
-                      AND CAST(position_date AS STRING) = {self._sql_literal(biz_date)}
-                      AND (is_latest = true OR is_latest IS NULL)
-                    """,
-                    database=db
-                ) or [{}]
-                if int(exists_rows[0].get('cnt', 0) or 0) > 0:
-                    break
-
+                self._mark_position_rows_not_latest(
+                    db=db,
+                    portfolio=portfolio,
+                    security_label=security,
+                    position_basis=basis,
+                    position_date=biz_date,
+                    src_system=src_system,
+                )
                 carry_row = dict(row)
                 carry_row['close_position_date'] = biz_date
                 self._upsert_authoritative_close_rows(
@@ -5992,34 +6012,19 @@ class UploadService:
                         continue
 
                     # Walk forward through each business date after the upload date
-                    # Stop as soon as an existing INT USER_UPLOAD record is found
                     for _biz_date in _biz_dates:
                         if _biz_date <= _upload_date:
                             continue  # skip dates on or before the upload date itself
 
-                        _exists_rows = impala_manager.execute_query(
-                            f"""
-                            SELECT COUNT(*) AS cnt
-                            FROM {db}.cis_position
-                            WHERE portfolio       = '{_ptf_esc}'
-                              AND security_label  = '{_sec_esc}'
-                              AND position_basis  = '{_basis}'
-                              AND src_system      = 'USER_UPLOAD'
-                              AND CAST(position_date AS STRING) = '{_biz_date}'
-                              AND (is_latest = true OR is_latest IS NULL)
-                            """,
-                            database=db
-                        )
-                        _date_exists = int((_exists_rows or [{}])[0].get('cnt', 0)) > 0
-
-                        if _date_exists:
-                            logger.info(
-                                f"[position_etl] Step 7A2: existing INT found for "
-                                f"{_ptf}/{_sec}/{_basis} on {_biz_date} — stopping carry-forward"
-                            )
-                            break  # stop walking forward for this portfolio/security/basis
-
                         # No existing row — carry the most recent position forward to this date
+                        self._mark_position_rows_not_latest(
+                            db=db,
+                            portfolio=_ptf,
+                            security_label=_sec,
+                            position_basis=_basis,
+                            position_date=_biz_date,
+                            src_system='USER_UPLOAD',
+                        )
                         _carry_ok = impala_manager.execute_write(
                             f"""
                             UPSERT INTO {db}.cis_position (

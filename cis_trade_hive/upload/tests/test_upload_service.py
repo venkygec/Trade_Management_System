@@ -835,7 +835,27 @@ class UploadServiceAuthoritativeCloseTestCase(TestCase):
         self.assertIn("NULL,", sql)
         self.assertNotIn("12.34", sql)
 
-    def test_carry_forward_authoritative_close_rows_stops_at_existing_future_row(self):
+    def test_mark_position_rows_not_latest_updates_exact_natural_key_date(self):
+        with patch('core.repositories.impala_connection.impala_manager') as mock_impala:
+            self.svc._mark_position_rows_not_latest(
+                db='gmp_cis',
+                portfolio='PORT-1',
+                security_label='AAPL US',
+                position_basis='SETTLED',
+                position_date='2026-01-02',
+                src_system='USER_UPLOAD',
+            )
+
+        sql = mock_impala.execute_write.call_args.args[0]
+        self.assertIn("UPDATE gmp_cis.cis_position", sql)
+        self.assertIn("portfolio = 'PORT-1'", sql)
+        self.assertIn("security_label = 'AAPL US'", sql)
+        self.assertIn("position_basis = 'SETTLED'", sql)
+        self.assertIn("CAST(position_date AS STRING) = '2026-01-02'", sql)
+        self.assertIn("src_system = 'USER_UPLOAD'", sql)
+        self.assertIn("AND is_latest = true", sql)
+
+    def test_carry_forward_authoritative_close_rows_keeps_carrying_to_today(self):
         rows = [{
             'portfolio': 'PORT-1',
             'security_label': 'AAPL US',
@@ -847,11 +867,8 @@ class UploadServiceAuthoritativeCloseTestCase(TestCase):
         }]
 
         with patch('core.repositories.impala_connection.impala_manager') as mock_impala:
-            mock_impala.execute_query.side_effect = [
-                [{'biz_date': '20260102'}, {'biz_date': '20260103'}],
-                [{'cnt': 0}],
-                [{'cnt': 1}],
-            ]
+            mock_impala.execute_query.return_value = [{'biz_date': '20260102'}, {'biz_date': '20260103'}]
+            self.svc._mark_position_rows_not_latest = MagicMock()
             self.svc._upsert_authoritative_close_rows = MagicMock(return_value=1)
             carried = self.svc._carry_forward_authoritative_close_rows(
                 db='gmp_cis',
@@ -859,10 +876,13 @@ class UploadServiceAuthoritativeCloseTestCase(TestCase):
                 processing_date='20260917',
             )
 
-        self.assertEqual(carried, 1)
-        self.svc._upsert_authoritative_close_rows.assert_called_once()
-        carry_rows = self.svc._upsert_authoritative_close_rows.call_args.kwargs['rows']
-        self.assertEqual(carry_rows[0]['close_position_date'], '2026-01-02')
+        self.assertEqual(carried, 2)
+        self.assertEqual(self.svc._mark_position_rows_not_latest.call_count, 2)
+        self.assertEqual(self.svc._upsert_authoritative_close_rows.call_count, 2)
+        first_call = self.svc._upsert_authoritative_close_rows.call_args_list[0]
+        second_call = self.svc._upsert_authoritative_close_rows.call_args_list[1]
+        self.assertEqual(first_call.kwargs['rows'][0]['close_position_date'], '2026-01-02')
+        self.assertEqual(second_call.kwargs['rows'][0]['close_position_date'], '2026-01-03')
 
 
 # ===========================================================================
