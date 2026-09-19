@@ -65,7 +65,6 @@ django.setup()
 from core.repositories.impala_connection import impala_manager  # noqa: E402
 from trade.services.position_id_service import (  # noqa: E402
     position_id as calc_position_id,
-    position_id_sql_expr,
 )
 
 # ---------------------------------------------------------------------------
@@ -224,6 +223,56 @@ def _mark_position_rows_not_latest(*, portfolio: str, security_label: str,
         """,
         database=DB
     )
+
+
+def _stage_position_ids() -> None:
+    rows = impala_manager.execute_query(
+        """
+        SELECT
+            row_id,
+            portfolio,
+            COALESCE(matched_security_name, security_full_name, security_short_name) AS security_label,
+            position_basis,
+            CAST(reporting_date AS STRING) AS position_date,
+            src_system
+        FROM position_upload_staging
+        WHERE overall_status LIKE 'VALID%'
+        """,
+        database=DB
+    ) or []
+    impala_manager.execute_write("DROP TABLE IF EXISTS pos_stage_position_ids", database=DB)
+    impala_manager.execute_write(
+        """
+        CREATE TABLE pos_stage_position_ids (
+            row_id BIGINT,
+            position_id BIGINT
+        )
+        STORED AS PARQUET
+        """,
+        database=DB
+    )
+    batch = []
+    for row in rows:
+        row_id = int(row.get('row_id') or 0)
+        position_id = calc_position_id(
+            row.get('portfolio'),
+            row.get('security_label'),
+            row.get('position_basis'),
+            row.get('position_date'),
+            row.get('src_system'),
+        )
+        batch.append(f"({row_id}, {position_id})")
+        if len(batch) >= 500:
+            impala_manager.execute_write(
+                f"INSERT INTO pos_stage_position_ids (row_id, position_id) VALUES {', '.join(batch)}",
+                database=DB
+            )
+            batch = []
+    if batch:
+        impala_manager.execute_write(
+            f"INSERT INTO pos_stage_position_ids (row_id, position_id) VALUES {', '.join(batch)}",
+            database=DB
+        )
 
 
 def _carry_forward_backdated_positions(processing_date: str) -> int:
@@ -2004,6 +2053,7 @@ def run_etl_for_table(table: str, processing_date: str, dry_run: bool,
     print("[Step 6] Consolidated staging complete")
 
     # ---- Step 7A: UPSERT into cis_position ----
+    _stage_position_ids()
     ok = impala_manager.execute_write(
         f"""
         UPSERT INTO {DB}.cis_position (
@@ -2017,13 +2067,7 @@ def run_etl_for_table(table: str, processing_date: str, dry_run: bool,
             uncall_fc, uncall_lc, pipeline_fc, pipeline_lc, position_type, is_latest
         )
         SELECT
-            {position_id_sql_expr(
-                "portfolio",
-                "COALESCE(matched_security_name, security_full_name, security_short_name)",
-                "position_basis",
-                "CAST(reporting_date AS STRING)",
-                "src_system",
-            )}                                              AS position_id,
+            pid.position_id                                  AS position_id,
             CAST(UNIX_TIMESTAMP() * 1000 AS BIGINT)         AS version_id,
             portfolio,
             COALESCE(matched_security_name, security_full_name, security_short_name) AS security_label,
@@ -2070,6 +2114,8 @@ def run_etl_for_table(table: str, processing_date: str, dry_run: bool,
             '{position_type}'                               AS position_type,
             true                                             AS is_latest
         FROM position_upload_staging
+        JOIN pos_stage_position_ids pid
+            ON pid.row_id = position_upload_staging.row_id
         LEFT JOIN (
             -- Per-row_id latest FX spot rate (FC->LC) as of the row's own
             -- reporting_date -- per SA requirement: "use latest fx rate
