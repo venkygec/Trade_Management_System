@@ -45,6 +45,14 @@
                         Auto-create security if not found
                     </label>
                 </div>
+                <div class="form-check form-check-inline align-middle me-2">
+                    <input class="form-check-input partialUploadInput" type="checkbox"
+                           name="partial_upload" id="partialUpload">
+                    <label class="form-check-label small" for="partialUpload"
+                           title="Unchecked = authoritative full-scope reconciliation by portfolio in file. Checked = only update uploaded rows and do not auto-close missing positions.">
+                        Partial upload
+                    </label>
+                </div>
                 <button type="button" class="btn btn-warning" onclick="confirmRunPosition()">
                     <i class="bi bi-play-circle"></i> Run Position
                 </button>
@@ -592,6 +600,14 @@
                                     Auto-create security if not found
                                 </label>
                             </div>
+                            <div class="form-check mb-2">
+                                <input class="form-check-input partialUploadInput" type="checkbox"
+                                       name="partial_upload" id="partialUploadSidebar">
+                                <label class="form-check-label small" for="partialUploadSidebar"
+                                       title="Unchecked = authoritative full-scope reconciliation by portfolio in file. Checked = only update uploaded rows and do not auto-close missing positions.">
+                                    Partial upload
+                                </label>
+                            </div>
                             <button type="button" class="btn btn-warning w-100" onclick="confirmRunPosition()">
                                 <i class="bi bi-play-circle"></i> Run Position ETL
                             </button>
@@ -935,13 +951,15 @@ function stopEtl(uploadId) {
         });
 }
 
-// Keep the header and sidebar "auto-create security" checkboxes in sync,
+// Keep duplicate checkboxes in sync,
 // since only one of the two forms actually gets submitted (whichever the
 // confirm dialog below finds first) but the user may have toggled either.
-document.querySelectorAll('.autoCreateSecurityInput').forEach(function(el) {
-    el.addEventListener('change', function() {
-        document.querySelectorAll('.autoCreateSecurityInput').forEach(function(other) {
-            other.checked = el.checked;
+['.autoCreateSecurityInput', '.partialUploadInput'].forEach(function(selector) {
+    document.querySelectorAll(selector).forEach(function(el) {
+        el.addEventListener('change', function() {
+            document.querySelectorAll(selector).forEach(function(other) {
+                other.checked = el.checked;
+            });
         });
     });
 });
@@ -956,10 +974,15 @@ function confirmRunPosition() {
     const pdDisplay = pd.slice(0,4) + '-' + pd.slice(4,6) + '-' + pd.slice(6,8);
     const autoCreateEl = document.querySelector('.autoCreateSecurityInput');
     const autoCreate = !!autoCreateEl && autoCreateEl.checked;
+    const partialUploadEl = document.querySelector('.partialUploadInput');
+    const partialUpload = !!partialUploadEl && partialUploadEl.checked;
     const autoCreateMsg = autoCreate
         ? '3. Auto-create a new security when no match is found'
         : '3. FAIL any position whose security has no match (auto-create is OFF)';
-    if (!confirm('Run Position ETL for processing_date=' + pdDisplay + '?\n\nThis will:\n1. Validate all upload rows\n2. Upsert valid rows into cis_position\n' + autoCreateMsg + '\n4. Write PASS/FAIL report to position_upload_report')) {
+    const reconMsg = partialUpload
+        ? '4. Partial mode — update only uploaded rows; do not auto-close missing positions'
+        : '4. Full mode — reconcile by portfolio scope in file and auto-close positions missing from the snapshot';
+    if (!confirm('Run Position ETL for processing_date=' + pdDisplay + '?\n\nThis will:\n1. Validate all upload rows\n2. Upsert valid rows into cis_position\n' + autoCreateMsg + '\n' + reconMsg + '\n5. Write PASS/FAIL report to position_upload_report')) {
         return;
     }
     // Set the date on both forms (header and sidebar)

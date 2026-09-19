@@ -2477,6 +2477,318 @@ class UploadService:
         'cis_user_sta_adhoc_position_5',
     }
 
+    def get_position_reconciliation_mode(self, _src_id: str, partial_upload: bool = False) -> str:
+        """Return FULL (default) or PARTIAL for the current ETL source."""
+        return 'PARTIAL' if partial_upload else 'FULL'
+
+    @staticmethod
+    def _sql_literal(value: Any) -> str:
+        """Escape a value for embedding in an Impala single-quoted literal."""
+        if value is None or str(value).strip() == '':
+            return 'NULL'
+        s = str(value).replace('’', "'").replace('‘', "'").replace('ʼ', "'")
+        s = s.replace("\\", "\\\\")
+        return "'" + s.replace("'", "\\'") + "'"
+
+    def _mark_position_rows_not_latest(
+        self,
+        *,
+        db: str,
+        portfolio: str,
+        security_label: str,
+        position_basis: str,
+        position_date: str,
+        src_system: str,
+    ) -> None:
+        """Mark existing latest rows for the exact natural key/date as superseded."""
+        from core.repositories.impala_connection import impala_manager
+
+        impala_manager.execute_write(
+            f"""
+            UPDATE {db}.cis_position
+            SET is_latest = false
+            WHERE portfolio = {self._sql_literal(portfolio)}
+              AND security_label = {self._sql_literal(security_label)}
+              AND position_basis = {self._sql_literal(position_basis)}
+              AND CAST(position_date AS STRING) = {self._sql_literal(position_date)}
+              AND src_system = {self._sql_literal(src_system)}
+              AND is_latest = true
+            """,
+            database=db
+        )
+
+    def _find_authoritative_missing_positions(
+        self,
+        *,
+        db: str,
+        staging_table: str,
+    ) -> List[Dict[str, Any]]:
+        """Return latest prior positions in scope that are absent from the incoming snapshot."""
+        from core.repositories.impala_connection import impala_manager
+
+        query = f"""
+            WITH incoming_scope AS (
+                SELECT DISTINCT
+                    COALESCE(valid_portfolio, portfolio) AS portfolio,
+                    position_basis,
+                    CAST(reporting_date AS STRING) AS reporting_date,
+                    src_system
+                FROM {staging_table}
+                WHERE COALESCE(valid_portfolio, portfolio) IS NOT NULL
+                  AND TRIM(COALESCE(valid_portfolio, portfolio)) != ''
+                  AND position_basis IS NOT NULL
+                  AND TRIM(position_basis) != ''
+                  AND reporting_date IS NOT NULL
+                  AND CAST(reporting_date AS STRING) != ''
+                  AND portfolio_status = 'PASS'
+            ),
+            prior_ranked AS (
+                SELECT
+                    s.portfolio,
+                    s.position_basis,
+                    s.reporting_date,
+                    s.src_system,
+                    p.portfolio,
+                    p.security_label,
+                    p.position_basis,
+                    p.position_date,
+                    p.src_system,
+                    p.source_table,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            s.portfolio,
+                            s.position_basis,
+                            s.reporting_date,
+                            s.src_system,
+                            p.security_label
+                        ORDER BY
+                            CAST(p.position_date AS STRING) DESC,
+                            COALESCE(p.version_id, CAST(0 AS BIGINT)) DESC
+                    ) AS rn
+                FROM incoming_scope s
+                JOIN {db}.cis_position p
+                  ON p.portfolio = s.portfolio
+                 AND p.position_basis = s.position_basis
+                 AND p.src_system = s.src_system
+                 AND CAST(p.position_date AS STRING) <= s.reporting_date
+                 AND (p.is_latest = true OR p.is_latest IS NULL)
+                 AND COALESCE(CAST(p.quantity AS DECIMAL(30,8)), CAST(0 AS DECIMAL(30,8))) != CAST(0 AS DECIMAL(30,8))
+            )
+            SELECT
+                p.portfolio,
+                p.security_label,
+                p.position_basis,
+                p.position_date AS previous_position_date,
+                p.reporting_date AS close_position_date,
+                p.src_system,
+                p.source_table
+            FROM prior_ranked p
+            WHERE p.rn = 1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {staging_table} s
+                  WHERE COALESCE(s.valid_portfolio, s.portfolio) = p.portfolio
+                    AND s.position_basis = p.position_basis
+                    AND CAST(s.reporting_date AS STRING) = p.reporting_date
+                    AND s.src_system = p.src_system
+                    AND s.matched_security_name = p.security_label
+              )
+            ORDER BY p.reporting_date, p.portfolio, p.position_basis, p.security_label
+        """
+        return impala_manager.execute_query(query, database=db) or []
+
+    def _upsert_authoritative_close_rows(
+        self,
+        *,
+        db: str,
+        rows: List[Dict[str, Any]],
+        processing_date: str,
+    ) -> int:
+        """Write zero-quantity closure rows for positions absent from an authoritative snapshot."""
+        from core.repositories.impala_connection import impala_manager
+        from trade.services.position_id_service import position_id as calc_position_id
+
+        if not rows:
+            return 0
+
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        values = []
+        for row in rows:
+            portfolio = row.get('portfolio')
+            security = row.get('security_label')
+            basis = row.get('position_basis')
+            position_date = str(row.get('close_position_date') or '')[:10]
+            src_system = row.get('src_system')
+            pos_id = calc_position_id(
+                portfolio=portfolio,
+                security_label=security,
+                position_basis=basis,
+                position_date=position_date,
+                src_system=src_system,
+            )
+            values.append(
+                f"""(
+                    {pos_id},
+                    CAST(UNIX_TIMESTAMP() * 1000 AS BIGINT),
+                    {self._sql_literal(portfolio)},
+                    {self._sql_literal(security)},
+                    {self._sql_literal(basis)},
+                    {self._sql_literal(position_date)},
+                    {self._sql_literal(src_system)},
+                    {self._sql_literal(processing_date)},
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    NULL,
+                    CAST(0 AS DECIMAL(30,8)),
+                    {self._sql_literal(row.get('source_table'))},
+                    {self._sql_literal(timestamp)},
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    CAST(0 AS DECIMAL(30,8)),
+                    'INT',
+                    true
+                )"""
+            )
+
+        impala_manager.execute_write(
+            f"""
+            UPSERT INTO {db}.cis_position (
+                position_id,
+                version_id,
+                portfolio,
+                security_label,
+                position_basis,
+                position_date,
+                src_system,
+                processing_date,
+                quantity,
+                average_cost_fc,
+                cost_fc,
+                market_value_fc,
+                net_book_value_fc,
+                unrealized_pnl_fc,
+                cost_lc,
+                market_value_lc,
+                net_book_value_lc,
+                unrealized_pnl_lc,
+                provision_lc,
+                provision_fc,
+                dividend_fc,
+                dividend_lc,
+                realized_pnl_fc,
+                realized_pnl_lc,
+                isin,
+                average_cost_lc,
+                source_table,
+                processing_timestamp,
+                uncall_fc,
+                uncall_lc,
+                pipeline_fc,
+                pipeline_lc,
+                position_type,
+                is_latest
+            ) VALUES {', '.join(values)}
+            """,
+            database=db
+        )
+        return len(rows)
+
+    def _carry_forward_authoritative_close_rows(
+        self,
+        *,
+        db: str,
+        rows: List[Dict[str, Any]],
+        processing_date: str,
+    ) -> int:
+        """Carry backdated zero-quantity closure rows forward like normal USER_UPLOAD INT rows."""
+        from datetime import date as _calendar_date
+        from core.repositories.impala_connection import impala_manager
+
+        backdated_rows = [
+            row for row in rows
+            if (row.get('src_system') == 'USER_UPLOAD'
+                and str(row.get('close_position_date') or '')[:10] < _calendar_date.today().isoformat())
+        ]
+        if not backdated_rows:
+            return 0
+
+        min_close_date = min(str(row.get('close_position_date') or '')[:10] for row in backdated_rows)
+        if not min_close_date:
+            return 0
+
+        today_iso = _calendar_date.today().isoformat()
+        min_close_key = min_close_date.replace('-', '')
+        today_key = today_iso.replace('-', '')
+        biz_dates_rows = impala_manager.execute_query(
+            f"""
+            SELECT contextual_today AS biz_date
+            FROM {db}.gmp_cis_sta_dly_alldatesinfo
+            WHERE src_system = 'gmp'
+              AND sub_system  = 'cis'
+              AND data_frq    = 'dly'
+              AND record_type = 'D'
+              AND CAST(contextual_today AS BIGINT) > {min_close_key}
+              AND CAST(contextual_today AS BIGINT) <= {today_key}
+            ORDER BY contextual_today ASC
+            """,
+            database=db
+        ) or []
+
+        def _to_iso(value: Any) -> str:
+            raw = str(value).strip()[:10].replace('-', '').replace('/', '')
+            if len(raw) == 8 and raw.isdigit():
+                return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+            return str(value)[:10]
+
+        biz_dates = [_to_iso(row.get('biz_date')) for row in biz_dates_rows if row.get('biz_date')]
+        carried = 0
+
+        for row in backdated_rows:
+            portfolio = row.get('portfolio', '')
+            security = row.get('security_label', '')
+            basis = row.get('position_basis', '')
+            upload_date = str(row.get('close_position_date') or '')[:10]
+            src_system = row.get('src_system') or 'USER_UPLOAD'
+            if not portfolio or not security or not upload_date:
+                continue
+
+            for biz_date in biz_dates:
+                if biz_date <= upload_date:
+                    continue
+                self._mark_position_rows_not_latest(
+                    db=db,
+                    portfolio=portfolio,
+                    security_label=security,
+                    position_basis=basis,
+                    position_date=biz_date,
+                    src_system=src_system,
+                )
+                carry_row = dict(row)
+                carry_row['close_position_date'] = biz_date
+                self._upsert_authoritative_close_rows(
+                    db=db,
+                    rows=[carry_row],
+                    processing_date=processing_date,
+                )
+                carried += 1
+
+        return carried
+
     def is_position_upload(self, upload: Dict[str, Any]) -> bool:
         """Return True if this upload's target table is one of the 5 position sources."""
         target = (upload.get('target_table_name') or '').lower().split('.')[-1]
@@ -2488,7 +2800,8 @@ class UploadService:
         src_id: str,
         processing_date: str,
         updated_by: str,
-        auto_create_security: bool = False
+        auto_create_security: bool = False,
+        partial_upload: bool = False,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
         Execute the position upload transform pipeline for a given partition.
@@ -2518,6 +2831,8 @@ class UploadService:
             src_id:    Source partition value (e.g. 'cis_user_sta_adhoc_position_1')
             processing_date: YYYYMMDD partition value
             updated_by: Username triggering the ETL
+            partial_upload: When True, keep the existing upload behavior and skip
+                the new authoritative missing-position closure path.
 
         Returns:
             Tuple of (success, message, result_dict)
@@ -2552,6 +2867,11 @@ class UploadService:
             })
 
             db = settings.IMPALA_CONFIG['DATABASE']
+            reconciliation_mode = self.get_position_reconciliation_mode(
+                src_id, partial_upload=partial_upload
+            )
+            result['reconciliation_mode'] = reconciliation_mode
+            result['partial_upload'] = reconciliation_mode == 'PARTIAL'
 
             # Namespaces every pos_stage_* staging table by upload_id so two
             # concurrent ETL runs never collide on the same physical Kudu
@@ -5556,6 +5876,38 @@ class UploadService:
             logger.info(f"[position_etl] Step 7A complete — {_s7a_upserted} is_latest=true rows in cis_position for this run")
             _t = _step_time("Step 7A (cis_position upsert)", _t)
 
+            result['closed_positions'] = 0
+            result['closed_positions_carried_forward'] = 0
+            if reconciliation_mode == 'FULL':
+                _missing_rows = self._find_authoritative_missing_positions(
+                    db=db,
+                    staging_table=f'position_upload_staging_{ETL_SFX}',
+                )
+                if _missing_rows:
+                    _closed_now = self._upsert_authoritative_close_rows(
+                        db=db,
+                        rows=_missing_rows,
+                        processing_date=processing_date,
+                    )
+                    result['closed_positions'] = _closed_now
+                    try:
+                        _hive_refresh_table('gmp_cis_sta_dly_alldatesinfo', "Authoritative carry-forward")
+                    except Exception:
+                        pass
+                    result['closed_positions_carried_forward'] = self._carry_forward_authoritative_close_rows(
+                        db=db,
+                        rows=_missing_rows,
+                        processing_date=processing_date,
+                    )
+                    logger.info(
+                        f"[position_etl] Authoritative reconciliation: closed {_closed_now} missing "
+                        f"position(s), carried {result['closed_positions_carried_forward']} forward"
+                    )
+                else:
+                    logger.info("[position_etl] Authoritative reconciliation: no missing positions to close")
+            else:
+                logger.info("[position_etl] Partial upload mode: authoritative missing-position closure skipped")
+
             # ------------------------------------------------------------------
             # Step 7A2: For backdated uploads (reporting_date < today), carry the
             # uploaded position forward through all valid business dates until today,
@@ -5660,34 +6012,19 @@ class UploadService:
                         continue
 
                     # Walk forward through each business date after the upload date
-                    # Stop as soon as an existing INT USER_UPLOAD record is found
                     for _biz_date in _biz_dates:
                         if _biz_date <= _upload_date:
                             continue  # skip dates on or before the upload date itself
 
-                        _exists_rows = impala_manager.execute_query(
-                            f"""
-                            SELECT COUNT(*) AS cnt
-                            FROM {db}.cis_position
-                            WHERE portfolio       = '{_ptf_esc}'
-                              AND security_label  = '{_sec_esc}'
-                              AND position_basis  = '{_basis}'
-                              AND src_system      = 'USER_UPLOAD'
-                              AND CAST(position_date AS STRING) = '{_biz_date}'
-                              AND (is_latest = true OR is_latest IS NULL)
-                            """,
-                            database=db
-                        )
-                        _date_exists = int((_exists_rows or [{}])[0].get('cnt', 0)) > 0
-
-                        if _date_exists:
-                            logger.info(
-                                f"[position_etl] Step 7A2: existing INT found for "
-                                f"{_ptf}/{_sec}/{_basis} on {_biz_date} — stopping carry-forward"
-                            )
-                            break  # stop walking forward for this portfolio/security/basis
-
                         # No existing row — carry the most recent position forward to this date
+                        self._mark_position_rows_not_latest(
+                            db=db,
+                            portfolio=_ptf,
+                            security_label=_sec,
+                            position_basis=_basis,
+                            position_date=_biz_date,
+                            src_system='USER_UPLOAD',
+                        )
                         _carry_ok = impala_manager.execute_write(
                             f"""
                             UPSERT INTO {db}.cis_position (

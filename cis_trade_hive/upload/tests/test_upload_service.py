@@ -763,6 +763,127 @@ class UploadServiceTestCase(TestCase):
     def test_is_position_upload_empty_target(self):
         self.assertFalse(self.svc.is_position_upload({'target_table_name': ''}))
 
+    def test_position_reconciliation_mode_defaults_to_full(self):
+        mode = self.svc.get_position_reconciliation_mode(
+            'cis_user_sta_adhoc_position_5',
+            partial_upload=False,
+        )
+        self.assertEqual(mode, 'FULL')
+
+    def test_position_reconciliation_mode_returns_partial_when_checkbox_selected(self):
+        self.assertEqual(
+            self.svc.get_position_reconciliation_mode(
+                'cis_user_sta_adhoc_position_5',
+                partial_upload=True,
+            ),
+            'PARTIAL'
+        )
+
+
+class UploadServiceAuthoritativeCloseTestCase(TestCase):
+
+    def setUp(self):
+        self.mock_repo = patch('upload.services.upload_service.upload_kudu_repository').start()
+        from upload.services.upload_service import UploadService
+        self.svc = UploadService()
+        self.addCleanup(patch.stopall)
+
+    def test_find_authoritative_missing_positions_uses_only_mapped_security_name(self):
+        with patch('core.repositories.impala_connection.impala_manager') as mock_impala:
+            mock_impala.execute_query.return_value = []
+            self.svc._find_authoritative_missing_positions(
+                db='gmp_cis',
+                staging_table='position_upload_staging_test',
+            )
+
+        sql = mock_impala.execute_query.call_args.args[0]
+        self.assertIn("AND s.matched_security_name = p.security_label", sql)
+        self.assertNotIn("final_isin", sql)
+        self.assertNotIn("security_full_name", sql)
+        self.assertNotIn("security_short_name", sql)
+
+    def test_upsert_authoritative_close_rows_writes_zero_quantity(self):
+        from trade.services.position_id_service import position_id as calc_position_id
+
+        rows = [{
+            'portfolio': 'PORT-1',
+            'security_label': 'AAPL US',
+            'position_basis': 'SETTLED',
+            'close_position_date': '2026-09-17',
+            'src_system': 'USER_UPLOAD',
+            'source_table': 'cis_user_sta_adhoc_position_5',
+        }]
+
+        with patch('core.repositories.impala_connection.impala_manager') as mock_impala:
+            mock_impala.execute_write.return_value = True
+            closed = self.svc._upsert_authoritative_close_rows(
+                db='gmp_cis',
+                rows=rows,
+                processing_date='20260917',
+            )
+
+        self.assertEqual(closed, 1)
+        sql = mock_impala.execute_write.call_args.args[0]
+        expected_position_id = calc_position_id('PORT-1', 'AAPL US', 'SETTLED', '2026-09-17', 'USER_UPLOAD')
+        self.assertIn("UPSERT INTO gmp_cis.cis_position", sql)
+        self.assertIn(f"{expected_position_id},", sql)
+        self.assertIn("'PORT-1'", sql)
+        self.assertIn("'AAPL US'", sql)
+        self.assertIn("CAST(0 AS DECIMAL(30,8))", sql)
+        self.assertIn("'USER_UPLOAD'", sql)
+        self.assertIn("'cis_user_sta_adhoc_position_5'", sql)
+        self.assertIn("NULL,", sql)
+        self.assertNotIn("12.34", sql)
+
+    def test_mark_position_rows_not_latest_updates_exact_natural_key_date(self):
+        with patch('core.repositories.impala_connection.impala_manager') as mock_impala:
+            self.svc._mark_position_rows_not_latest(
+                db='gmp_cis',
+                portfolio='PORT-1',
+                security_label='AAPL US',
+                position_basis='SETTLED',
+                position_date='2026-01-02',
+                src_system='USER_UPLOAD',
+            )
+
+        sql = mock_impala.execute_write.call_args.args[0]
+        self.assertIn("UPDATE gmp_cis.cis_position", sql)
+        self.assertIn("portfolio = 'PORT-1'", sql)
+        self.assertIn("security_label = 'AAPL US'", sql)
+        self.assertIn("position_basis = 'SETTLED'", sql)
+        self.assertIn("CAST(position_date AS STRING) = '2026-01-02'", sql)
+        self.assertIn("src_system = 'USER_UPLOAD'", sql)
+        self.assertIn("AND is_latest = true", sql)
+
+    def test_carry_forward_authoritative_close_rows_keeps_carrying_to_today(self):
+        rows = [{
+            'portfolio': 'PORT-1',
+            'security_label': 'AAPL US',
+            'position_basis': 'SETTLED',
+            'close_position_date': '2026-01-01',
+            'src_system': 'USER_UPLOAD',
+            'isin': 'US0378331005',
+            'source_table': 'cis_user_sta_adhoc_position_5',
+        }]
+
+        with patch('core.repositories.impala_connection.impala_manager') as mock_impala:
+            mock_impala.execute_query.return_value = [{'biz_date': '20260102'}, {'biz_date': '20260103'}]
+            self.svc._mark_position_rows_not_latest = MagicMock()
+            self.svc._upsert_authoritative_close_rows = MagicMock(return_value=1)
+            carried = self.svc._carry_forward_authoritative_close_rows(
+                db='gmp_cis',
+                rows=rows,
+                processing_date='20260917',
+            )
+
+        self.assertEqual(carried, 2)
+        self.assertEqual(self.svc._mark_position_rows_not_latest.call_count, 2)
+        self.assertEqual(self.svc._upsert_authoritative_close_rows.call_count, 2)
+        first_call = self.svc._upsert_authoritative_close_rows.call_args_list[0]
+        second_call = self.svc._upsert_authoritative_close_rows.call_args_list[1]
+        self.assertEqual(first_call.kwargs['rows'][0]['close_position_date'], '2026-01-02')
+        self.assertEqual(second_call.kwargs['rows'][0]['close_position_date'], '2026-01-03')
+
 
 # ===========================================================================
 # UploadService — validate_file delegates correctly
